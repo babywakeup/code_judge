@@ -1,0 +1,26 @@
+{
+  "target": "../source/data/SD-1/10-21/Tlink-Image-1792571365518.jpeg",
+  "templates": [
+    {
+      "name": "SD1_template_A",
+      "image": "../source/data/SD-1/10-21/Tlink-Image-1792571258237.jpeg"
+    },
+    {
+      "name": "SD1_template_B",
+      "image": "/mnt/wh_intern/Public/zrx/projects/code_judge/source/data/SD-1/10-21/Tlink-Image-1792571343428.jpeg"
+    }
+  ],
+  "label_mode": "semantic",
+  "demo_annotations": true,
+  "options": {
+    "max_side": 800,
+    "angles": [-2, 0, 2],
+    "scales": [0.97, 1.0, 1.03],
+    "bottom_ignore_fraction": 0.08,
+    "min_overlap": 0.45,
+    "min_score": 60,
+    "min_template_gap": 3,
+    "refine_candidates": 8,
+    "ecc_iterations": 70
+  }
+}

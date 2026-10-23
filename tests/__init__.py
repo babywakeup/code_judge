@@ -1,0 +1,1 @@
+"""Tests are kept outside the application package; run unittest discovery here."""

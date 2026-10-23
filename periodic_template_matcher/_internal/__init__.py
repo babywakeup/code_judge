@@ -1,0 +1,1 @@
+"""Implementation details; applications should use the public Matcher API."""

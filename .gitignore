@@ -1,0 +1,16 @@
+# VS Code
+.vscode/
+.idea/
+*.swp
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.pytype/
+# Local generated outputs
+periodic_template_matcher/results/
+periodic_template_matcher/**/__pycache__/
+*.log
+source/
