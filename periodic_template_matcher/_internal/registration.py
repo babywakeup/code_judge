@@ -4,18 +4,51 @@ Every public matrix maps TEMPLATE pixels to TARGET pixels. Scores are
 engineering similarities, not probabilities or proof of absolute cell identity.
 This module has no file IO, CLI, label evaluation or visualization dependencies.
 """
-from dataclasses import asdict
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
 import math
 
 import cv2
 import numpy as np
 
-from .opencv_registration import translation_peaks as opencv_translation_peaks
 from ..config import MatcherConfig
 from ..utils import ValidRegion, build_valid_mask, to_gray
+from ..utils.types import Array, Diagnostics, Image, Mask, Matrix, Shape, Size
+from .opencv_registration import translation_peaks as opencv_translation_peaks
 
 
-def _features(gray, mask):
+Features = tuple[Array, Array, Array, Array]  # Normalized intensity, gradient, edges, ROI.
+
+
+@dataclass(frozen=True)
+class PreparedImage:
+    """One image at working resolution and its original-to-working transform."""
+
+    shape: Shape
+    to_work: Matrix
+    scale: float
+    features: Features | None
+
+
+def _prepare_image(image: Image, valid: Mask | None, cfg: MatcherConfig,
+                   scale: float) -> PreparedImage:
+    gray = to_gray(image)
+    mask = build_valid_mask(gray, valid, cfg)
+    size = (round(gray.shape[1] * scale), round(gray.shape[0] * scale))
+    if min(size) < 32:
+        raise ValueError('Extreme image aspect/size mismatch; use comparable fields of view')
+    to_work = np.diag([size[0] / gray.shape[1], size[1] / gray.shape[0], 1.0])
+    gray, mask = ValidRegion.resize_for_matching(gray, mask, size)
+    features = _features(gray, mask) if np.std(gray[mask > 0]) >= 2 else None
+    if features is not None and features[2].sum() < 40:
+        features = None
+    return PreparedImage(gray.shape, to_work, scale, features)
+
+
+def _features(gray: Image, mask: Mask) -> Features:
     x = gray.astype(np.float32) / 255.0
     # Repair excluded overlays before filtering to avoid leaking text/borders.
     if not mask.all():
@@ -36,13 +69,14 @@ def _features(gray, mask):
     return norm.astype(np.float32) * safe, grad * safe, edges, safe
 
 
-def _corr(a, b, fft_shape):
+def _corr(a: Array, b: Array, fft_shape: Shape) -> Array:
     fa = np.fft.rfft2(a, s=fft_shape)
     fb = np.fft.rfft2(b, s=fft_shape)
     return np.fft.irfft2(fa * np.conj(fb), s=fft_shape).real
 
 
-def _translation_peaks(source, target, sm, tm, cfg):
+def _translation_peaks(source: Array, target: Array, sm: Mask, tm: Mask,
+                       cfg: MatcherConfig) -> list[tuple[float, float, float]]:
     """Linear (not circular) normalized correlation, multiple displacement peaks."""
     sh, sw = source.shape
     th, tw = target.shape
@@ -68,7 +102,7 @@ def _translation_peaks(source, target, sm, tm, cfg):
     return peaks
 
 
-def _centered_warp(shape, angle, scale):
+def _centered_warp(shape: Shape, angle: float, scale: float) -> tuple[Matrix, Size]:
     h, w = shape
     A = cv2.getRotationMatrix2D(((w-1)/2, (h-1)/2), float(angle), float(scale))
     corners = cv2.transform(np.array([[[0., 0.], [w-1., 0.], [w-1., h-1.], [0., h-1.]]]), A)[0]
@@ -77,14 +111,14 @@ def _centered_warp(shape, angle, scale):
     return np.vstack([A, [0, 0, 1]]), tuple((np.ceil(high-low).astype(int)+1).tolist())
 
 
-def _ncc(x, y):
+def _ncc(x: Array, y: Array) -> float:
     if len(x) < 32:
         return 0.0
     x, y = x - x.mean(), y - y.mean()
     return float(np.clip(np.dot(x, y) / max(np.linalg.norm(x)*np.linalg.norm(y), 1e-9), 0, 1))
 
 
-def _score(src, dst, H, cfg):
+def _score(src: Features, dst: Features, H: Matrix, cfg: MatcherConfig) -> Diagnostics:
     sn, _, se, sm = src
     tn, _, te, tm = dst
     size = (tn.shape[1], tn.shape[0])
@@ -119,7 +153,7 @@ def _score(src, dst, H, cfg):
                 edge_distance_p95_work_px=float(np.percentile(distances, 95)))
 
 
-def _refine(src, dst, H, cfg):
+def _refine(src: Features, dst: Features, H: Matrix, cfg: MatcherConfig) -> tuple[Matrix, bool]:
     sn, _, _, sm = src
     tn, _, _, tm = dst
     current = H.copy()
@@ -151,7 +185,7 @@ def _refine(src, dst, H, cfg):
     return current, converged
 
 
-def _periods(feature, mask):
+def _periods(feature: Array, mask: Mask) -> list[Diagnostics]:
     """Diagnostic lattice candidates; harmonics are not unique cell identities."""
     h, w = feature.shape
     shape = (cv2.getOptimalDFTSize(2*h-1), cv2.getOptimalDFTSize(2*w-1))
@@ -174,56 +208,55 @@ def _periods(feature, mask):
     return result
 
 
-def _transform_difference(a, b, shape):
+def _transform_difference(a: Matrix, b: Matrix, shape: Shape) -> float:
     h, w = shape
     pts = np.array([[[w*.2, h*.2], [w*.8, h*.2], [w*.5, h*.5], [w*.2, h*.8], [w*.8, h*.8]]], np.float32)
     return float(np.median(np.linalg.norm(cv2.perspectiveTransform(pts, a) - cv2.perspectiveTransform(pts, b), axis=2)))
 
 
-def register(template, target, cfg=None, template_valid=None, target_valid=None, *, working_scale=None):
+def register(template: Image, target: Image, cfg: MatcherConfig | None = None,
+             template_valid: Mask | None = None, target_valid: Mask | None = None,
+             *, working_scale: float | None = None) -> Diagnostics:
     """Return registration diagnostics; a high score is not an identity proof."""
     cfg = cfg or MatcherConfig()
     cfg.validate()
-    a, b = to_gray(template), to_gray(target)
-    am, bm = build_valid_mask(a, template_valid, cfg), build_valid_mask(b, target_valid, cfg)
-    # Shared nominal scale, exact per-image rounding matrices retained.
-    scale = min(1.0, cfg.max_side / max(*a.shape, *b.shape)) if working_scale is None else working_scale
-    ashape = (round(a.shape[1]*scale), round(a.shape[0]*scale))
-    bshape = (round(b.shape[1]*scale), round(b.shape[0]*scale))
-    if min(*ashape, *bshape) < 32:
-        raise ValueError('Extreme image aspect/size mismatch; use comparable fields of view')
-    Da = np.diag([ashape[0]/a.shape[1], ashape[1]/a.shape[0], 1.0])
-    Db = np.diag([bshape[0]/b.shape[1], bshape[1]/b.shape[0], 1.0])
-    aa, am = ValidRegion.resize_for_matching(a, am, ashape)
-    bb, bm = ValidRegion.resize_for_matching(b, bm, bshape)
-    fail = dict(match_score=0.0, geometry_accepted=False, absolute_cell_verified=False,
-                periodic_detected=False, matrix_template_to_target=None, candidates=[],
-                working_scale=scale, working_target_size=list(bshape),
-                reasons=['insufficient_texture_or_overlap'])
-    if np.std(aa[am > 0]) < 2 or np.std(bb[bm > 0]) < 2:
-        return fail
-    src, dst = _features(aa, am), _features(bb, bm)
-    if src[2].sum() < 40 or dst[2].sum() < 40:
-        return fail
-    lattice = _periods(dst[0], dst[3])
+    scale = cfg.matching_scale(template.shape, target.shape) if working_scale is None else working_scale
+    source = _prepare_image(template, template_valid, cfg, scale)
+    destination = _prepare_image(target, target_valid, cfg, scale)
+    lattice = _periods(destination.features[0], destination.features[3]) if destination.features is not None else []
+    return _register_prepared(source, destination, cfg, lattice)
+
+
+def _coarse_candidates(src: Features, dst: Features, cfg: MatcherConfig) -> list[Matrix]:
+    """Search angle/scale/translation hypotheses and keep distinct candidates."""
+    shape = src[0].shape
+    search = opencv_translation_peaks if cfg.backend == 'opencv' else _translation_peaks
     coarse = []
     for angle in cfg.angles:
         for zoom in cfg.scales:
-            A, size = _centered_warp(aa.shape, angle, zoom)
+            A, size = _centered_warp(shape, angle, zoom)
             sg = cv2.warpPerspective(src[1], A, size)
             sm = cv2.warpPerspective(src[3], A, size, flags=cv2.INTER_NEAREST)
-            search = opencv_translation_peaks if cfg.backend == 'opencv' else _translation_peaks
             for merit, dx, dy in search(sg, dst[1], sm, dst[3], cfg):
                 H = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]], float) @ A
                 coarse.append((merit, H))
     shortlist = []
-    for merit, H in sorted(coarse, key=lambda x: x[0], reverse=True):
-        if all(_transform_difference(H, prev, aa.shape) > 4 for _, prev in shortlist):
-            shortlist.append((merit, H))
+    for _, H in sorted(coarse, key=lambda item: item[0], reverse=True):
+        if all(_transform_difference(H, previous, shape) > 4 for previous in shortlist):
+            shortlist.append(H)
         if len(shortlist) >= cfg.refine_candidates:
             break
+    return shortlist
+
+
+def _refine_candidates(source: PreparedImage, target: PreparedImage,
+                       cfg: MatcherConfig) -> list[Diagnostics]:
+    """Refine, score and deduplicate candidates; retain original-coordinate matrices."""
+    src, dst = source.features, target.features
+    assert src is not None and dst is not None
     candidates = []
-    for _, H in shortlist:
+    to_original = np.linalg.inv(target.to_work)
+    for H in _coarse_candidates(src, dst, cfg):
         metrics = _score(src, dst, H, cfg)
         refined, ecc_ok = _refine(src, dst, H, cfg)
         refined_metrics = _score(src, dst, refined, cfg)
@@ -231,10 +264,24 @@ def register(template, target, cfg=None, template_valid=None, target_valid=None,
             H, metrics = refined, refined_metrics
         else:
             ecc_ok = False
-        if all(_transform_difference(H, np.asarray(c['_H_work']), aa.shape) > 3 for c in candidates):
+        if all(_transform_difference(H, np.asarray(c['_H_work']), source.shape) > 3 for c in candidates):
             metrics.update(_H_work=H.tolist(), ecc_converged=bool(ecc_ok),
-                           matrix_template_to_target=(np.linalg.inv(Db) @ H @ Da).tolist())
+                           matrix_template_to_target=(to_original @ H @ source.to_work).tolist())
             candidates.append(metrics)
+    return candidates
+
+
+def _register_prepared(source: PreparedImage, target: PreparedImage,
+                       cfg: MatcherConfig, lattice: list[Diagnostics]) -> Diagnostics:
+    """Match prepared images without repeating boundary validation or preprocessing."""
+    size = [target.shape[1], target.shape[0]]
+    fail = dict(match_score=0.0, geometry_accepted=False, absolute_cell_verified=False,
+                periodic_detected=False, matrix_template_to_target=None, candidates=[],
+                working_scale=target.scale, working_target_size=size,
+                reasons=['insufficient_texture_or_overlap'])
+    if source.features is None or target.features is None:
+        return fail
+    candidates = _refine_candidates(source, target, cfg)
     if not candidates:
         return fail
     candidates.sort(key=lambda c: c['match_score'], reverse=True)
@@ -242,7 +289,7 @@ def register(template, target, cfg=None, template_valid=None, target_valid=None,
     gap = best['match_score'] - candidates[1]['match_score'] if len(candidates) > 1 else None
     # Autocorrelation plus far-apart near-equal matches flag periodic ambiguity.
     alias = any(best['match_score'] - c['match_score'] < cfg.min_candidate_gap and
-                _transform_difference(np.asarray(best['_H_work']), np.asarray(c['_H_work']), aa.shape) > min(aa.shape)*0.12
+                _transform_difference(np.asarray(best['_H_work']), np.asarray(c['_H_work']), source.shape) > min(source.shape)*0.12
                 for c in candidates[1:])
     periodic = bool(lattice or alias)
     accepted = best['match_score'] >= cfg.min_score and best['target_coverage'] >= cfg.min_overlap
@@ -253,14 +300,18 @@ def register(template, target, cfg=None, template_valid=None, target_valid=None,
                 absolute_cell_verified=bool(accepted and not periodic and gap is not None and gap >= cfg.min_candidate_gap),
                 absolute_identity_status='unverified_periodic' if periodic else 'visual_evidence_only',
                 candidate_score_gap=gap, periodic_alias_detected=bool(alias), lattice_candidates=lattice,
-                working_scale=scale, working_target_size=list(bshape), candidates=candidates,
+                working_scale=target.scale, working_target_size=size, candidates=candidates,
                 reasons=[] if accepted else ['score_or_coverage_below_threshold'])
     if periodic:
         best['reasons'].append('absolute_period_index_requires_external_anchor')
     return best
 
 
-def select_templates(templates, target, cfg=None, template_valids=None, target_valid=None, label_mode='semantic'):
+def select_templates(templates: Sequence[Image], target: Image,
+                     cfg: MatcherConfig | None = None,
+                     template_valids: Sequence[Mask | None] | None = None,
+                     target_valid: Mask | None = None,
+                     label_mode: str = 'semantic') -> Diagnostics:
     """Rank templates on the same target ROI, scale and score definition.
 
     semantic allows shared cell classes; instance requires verified identity.
@@ -275,10 +326,13 @@ def select_templates(templates, target, cfg=None, template_valids=None, target_v
         raise ValueError('One valid mask per template is required')
     cv2.setRNGSeed(cfg.seed)
     cv2.setNumThreads(2)
-    common_scale = min(1.0, cfg.max_side / max(max(to_gray(im).shape) for im in [*templates, target]))
+    common_scale = cfg.matching_scale(*(im.shape for im in [*templates, target]))
+    destination = _prepare_image(target, target_valid, cfg, common_scale)
+    lattice = _periods(destination.features[0], destination.features[3]) if destination.features is not None else []
     matches = []
     for i, (template, valid) in enumerate(zip(templates, template_valids)):
-        result = register(template, target, cfg, valid, target_valid, working_scale=common_scale)
+        source = _prepare_image(template, valid, cfg, common_scale)
+        result = _register_prepared(source, destination, cfg, lattice)
         result['template_index'] = i
         matches.append(result)
     ranked = sorted(matches, key=lambda r: r['match_score'], reverse=True)

@@ -1,17 +1,24 @@
 """Mask validation, template-to-target label warping and label overlays."""
+
+from __future__ import annotations
+
 from collections.abc import Sequence
 
 import cv2
 import numpy as np
+
+from ..config import MatcherConfig
 from .regions import ValidRegion
+from .types import BoolMask, ClassIds, Image, LabelInput, LabelMap, Mask, Matrix, Shape
 
 
-def build_valid_mask(gray, mask, cfg, valid_height=None):
+def build_valid_mask(gray: Image, mask: Mask | None, cfg: MatcherConfig,
+                     valid_height: int | None = None) -> Mask:
     """Build a matching ROI; label knowledge is represented separately."""
     return ValidRegion.from_config(cfg, valid_height).build_mask(gray, mask)
 
 
-def normalize_masks(masks, shape, name='masks'):
+def normalize_masks(masks: LabelInput, shape: Shape, name: str = 'masks') -> LabelMap:
     """Accept an HxW class-ID array or disjoint binary masks for classes 1..K.
 
     An empty binary-mask list means known background everywhere. A class-ID
@@ -44,7 +51,20 @@ def normalize_masks(masks, shape, name='masks'):
     return labels
 
 
-def warp_labels(labels, H, target_shape, source_valid=None):
+def warp_valid_mask(mask: Mask, H: Matrix, target_shape: Sequence[int]) -> BoolMask:
+    """Project an HxW validity mask to target coordinates with nearest neighbors."""
+    if mask.ndim != 2:
+        raise ValueError('valid mask must be a 2D array')
+    H = np.asarray(H, np.float64)
+    if H.shape != (3, 3) or not np.isfinite(H).all() or abs(np.linalg.det(H)) < 1e-10:
+        raise ValueError('H must be an invertible 3x3 TEMPLATE-to-TARGET matrix')
+    h, w = target_shape[:2]
+    return cv2.warpPerspective((mask > 0).astype(np.uint8), H, (w, h),
+                               flags=cv2.INTER_NEAREST) > 0
+
+
+def warp_labels(labels: ClassIds, H: Matrix, target_shape: Sequence[int],
+                source_valid: Mask | None = None) -> tuple[LabelMap, BoolMask]:
     """Warp integer IDs TEMPLATE -> TARGET; False validity means unknown.
 
     Returns uint16 labels and boolean validity. No periodic extrapolation.
@@ -57,17 +77,15 @@ def warp_labels(labels, H, target_shape, source_valid=None):
     if source_valid is not None and source_valid.shape != labels.shape:
         raise ValueError('source_valid must match labels')
     H = np.asarray(H, np.float64)
-    if H.shape != (3, 3) or not np.isfinite(H).all() or abs(np.linalg.det(H)) < 1e-10:
-        raise ValueError('H must be an invertible 3x3 TEMPLATE-to-TARGET matrix')
+    source_mask = np.ones(labels.shape, np.uint8) if source_valid is None else source_valid
+    valid = warp_valid_mask(source_mask, H, target_shape)
     h, w = target_shape[:2]
     warped = cv2.warpPerspective(labels.astype(np.uint16), H, (w, h), flags=cv2.INTER_NEAREST,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    valid = np.ones(labels.shape, np.uint8) if source_valid is None else (source_valid > 0).astype(np.uint8)
-    valid = cv2.warpPerspective(valid, H, (w, h), flags=cv2.INTER_NEAREST) > 0
     return warped, valid
 
 
-def overlay_labels(image, labels, valid):
+def overlay_labels(image: Image, labels: ClassIds, valid: BoolMask) -> Image:
     """Blend non-background class colors without mutating input arrays."""
     image = image.copy()
     if image.ndim == 2:

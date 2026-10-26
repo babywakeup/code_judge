@@ -1,15 +1,22 @@
 """Self-contained, offline HTML report and a readable six-panel contact sheet."""
-import base64
+
+from __future__ import annotations
+
+from collections.abc import Sequence
 from html import escape
+from pathlib import Path
+import base64
 
 import cv2
 import numpy as np
 
-from .results import EvaluationResult, MatchResult
 from ..utils import overlay_labels, to_gray, write_image
+from ..utils.types import Array, BoolMask, Diagnostics, Image, PathInput
+from .results import EvaluationResult, MatchResult
 
 
-def visualize_match(result, output_path=None):
+def visualize_match(result: MatchResult | EvaluationResult,
+                    output_path: PathInput | None = None) -> Image:
     """Render MatchResult/EvaluationResult as six BGR panels without GUI deps.
 
     Prediction colors are deterministic class-ID colors. Uncovered/unknown
@@ -22,14 +29,14 @@ def visualize_match(result, output_path=None):
     if not isinstance(match, MatchResult):
         raise TypeError('result must be MatchResult or EvaluationResult')
 
-    def bgr(image):
+    def bgr(image: Image) -> Image:
         if image.ndim == 2:
             return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         if image.shape[2] == 4:
             return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
         return image.copy()
 
-    def shaded(image, valid):
+    def shaded(image: Image, valid: BoolMask) -> Image:
         image = bgr(image)
         image[~valid] = (image[~valid].astype(np.float32) * .18).astype(np.uint8)
         return image
@@ -91,7 +98,7 @@ def visualize_match(result, output_path=None):
     return canvas
 
 
-def _uri(image, max_side=1280):
+def _uri(image: Image, max_side: int = 1280) -> str:
     scale = min(1., max_side / max(image.shape[:2]))
     if scale < 1:
         image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -101,7 +108,7 @@ def _uri(image, max_side=1280):
     return 'data:image/jpeg;base64,' + base64.b64encode(data).decode('ascii')
 
 
-def _diagnostics(target, warped, valid):
+def _diagnostics(target: Image, warped: Image, valid: BoolMask) -> tuple[Image, Image, Image, Image]:
     """Target edges cyan, warped-template edges magenta, coincidences white."""
     gray = to_gray(target)
     clahe = cv2.createCLAHE(clipLimit=2., tileGridSize=(12, 12))
@@ -116,7 +123,7 @@ def _diagnostics(target, warped, valid):
     edges[eb] = (230, 45, 255)
     edges[ea & eb] = (255, 255, 255)
     # Diagnostic only: local contrast-normalized image difference, not defects.
-    def norm(x):
+    def norm(x: Array) -> Array:
         x = cv2.GaussianBlur(x.astype(np.float32) / 255, (0, 0), 1.)
         mean = cv2.GaussianBlur(x, (0, 0), 15)
         var = np.maximum(cv2.GaussianBlur(x*x, (0, 0), 15) - mean*mean, 0)
@@ -136,7 +143,7 @@ def _diagnostics(target, warped, valid):
     return edges, checker, heat, coverage
 
 
-def _overview(out, panels, result):
+def _overview(out: Path, panels: Sequence[tuple[str, Image]], result: Diagnostics) -> None:
     width = 680
     height = 565
     canvas = np.full((3 * (height + 54) + 90, 2 * width, 3), (24, 19, 15), np.uint8)
@@ -156,7 +163,8 @@ def _overview(out, panels, result):
     write_image(out / 'overview.jpg', canvas)
 
 
-def build_report(out, result, images, target, views):
+def build_report(out: Path, result: Diagnostics, images: Sequence[Image],
+                 target: Image, views: dict[str, Array]) -> None:
     best = result['matches'][result['ranking'][0]]
     selected = images[best['template_index']]
     available = 'warped' in views

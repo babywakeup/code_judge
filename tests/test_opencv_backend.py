@@ -74,12 +74,14 @@ class OpenCVBackendTests(unittest.TestCase):
             write_image(root / 'source.png', image)
             write_image(root / 'labels.png', labels)
             spec = dict(target='source.png', templates=[dict(image='source.png', labels='labels.png')],
-                        options=dict(backend='opencv', max_side=200, angles=[0], scales=[1],
-                                     refine_candidates=2, ecc_iterations=20))
+                        options=dict(step1=dict(max_side=200, scale=1.),
+                                     step2=dict(backend='opencv', angles=[0], scales=[1]),
+                                     step3=dict(refine_candidates=2, ecc_iterations=20)))
             path = root / 'config.json'
             path.write_text(json.dumps(spec), encoding='utf-8')
             result = run_config(path, root / 'out')
             self.assertEqual(result['config']['backend'], 'opencv')
+            self.assertEqual(result['matches'][0]['working_scale'], 1.)
             self.assertTrue(result['labels_exported'])
             self.assertTrue((root / 'out' / 'mapped_labels.png').exists())
 

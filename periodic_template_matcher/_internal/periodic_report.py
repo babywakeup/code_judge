@@ -1,17 +1,23 @@
 """Offline two-opacity preview for direct and periodic template image layers."""
+
+from __future__ import annotations
+
+from pathlib import Path
 import base64
 
 import cv2
 import numpy as np
 
 from ..utils import write_image
+from ..utils.types import Image, Mask
+from .results import MatchResult
 
 
 ARTIFACTS = ('periodic_overlay.html', 'completed_alignment.jpg', 'completed_geometric_valid.png',
              'periodic_valid.png', 'label_periodic_valid.png', 'completion_regions.jpg')
 
 
-def bgr(image):
+def bgr(image: Image) -> Image:
     if image.ndim == 2:
         return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     if image.shape[2] == 4:
@@ -19,7 +25,7 @@ def bgr(image):
     return image
 
 
-def export_completion(out, match):
+def export_completion(out: Path, match: MatchResult) -> Image:
     target, complete = bgr(match.input_image), bgr(match.completed_template)
     blend = target.copy()
     blend[match.completed_valid] = cv2.addWeighted(target, .5, complete, .5, 0)[match.completed_valid]
@@ -34,7 +40,7 @@ def export_completion(out, match):
         cv2.drawContours(marked, contours, -1, color, 3)
     write_image(out/'completion_regions.jpg', marked)
 
-    def uri(image, mask=None):
+    def uri(image: Image, mask: Mask | None = None) -> str:
         if mask is not None:
             image = cv2.cvtColor(bgr(image), cv2.COLOR_BGR2BGRA)
             image[:, :, 3] = mask.astype(np.uint8)*255

@@ -1,8 +1,14 @@
 """Coverage-aware segmentation metrics; independent of image registration."""
+
+from __future__ import annotations
+
 import numpy as np
 
+from ..utils.types import BoolMask, Diagnostics, LabelMap, Mask
 
-def _metrics(prediction, truth, known, roi, include_background):
+
+def _metrics(prediction: LabelMap, truth: LabelMap, known: BoolMask,
+             roi: BoolMask, include_background: bool) -> Diagnostics:
     # Unknown predictions are abstentions, not class 0: FN for the true class,
     # no FP for any predicted class, and incorrect for pixel accuracy.
     ids = np.union1d(np.unique(truth[roi]), np.unique(prediction[roi & known]))
@@ -29,7 +35,9 @@ def _metrics(prediction, truth, known, roi, include_background):
                 evaluated_pixels=count, per_class=per_class)
 
 
-def evaluate_segmentation(prediction, truth, prediction_valid, truth_valid, *, include_background=False):
+def evaluate_segmentation(prediction: LabelMap, truth: LabelMap,
+                          prediction_valid: Mask, truth_valid: Mask, *,
+                          include_background: bool = False) -> Diagnostics:
     """Score full GT ROI; also expose overlap-only metrics and abstention rate.
 
     All inputs must be same-sized 2D arrays. Classes absent from both prediction

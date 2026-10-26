@@ -19,6 +19,26 @@ PACKAGE_DIR = ROOT / 'periodic_template_matcher'
 
 
 class PackageTests(unittest.TestCase):
+    def test_grouped_options(self):
+        cfg = config.MatcherConfig.from_options({
+            'step1': {'description': 'Resize inputs', 'scale': .5, 'max_side': 800},
+            'step2': {'description': 'Coarse search', 'backend': 'opencv', 'angles': [0], 'scales': [1]},
+            'step3': {'description': 'Refine', 'ecc_iterations': 30},
+            'periodic': {'description': 'Complete', 'periodic_completion': True},
+            'evaluation': {'description': 'Evaluate'}})
+        self.assertEqual(cfg.matching_scale((160, 200)), .5)
+        self.assertEqual(cfg.backend, 'opencv')
+        self.assertEqual(cfg.ecc_iterations, 30)
+        self.assertTrue(cfg.periodic_completion)
+        self.assertEqual(config.MatcherConfig.from_options({'scale': .5}).scale, .5)
+
+    def test_grouped_options_reject_ambiguous_or_misplaced_fields(self):
+        for options in ({'scale': 1, 'step1': {'scale': .5}},
+                        {'step1': {'angles': [0]}}, {'step2': []},
+                        {'step9': {}}, {'step1': {'scale': 0}}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                config.MatcherConfig.from_options(options)
+
     def run_python(self, *args, cwd=ROOT):
         return subprocess.run([sys.executable, *args], cwd=cwd, check=True,
                               capture_output=True, text=True, timeout=30)

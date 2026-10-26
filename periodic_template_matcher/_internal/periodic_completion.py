@@ -1,15 +1,21 @@
 """Verified lattice copies fill unknown target labels without overwriting direct data."""
+
+from __future__ import annotations
+
 from dataclasses import replace
 from itertools import product
 
 import cv2
 import numpy as np
 
+from ..config import MatcherConfig
+from ..utils import ValidRegion, to_gray, warp_labels, warp_valid_mask
+from ..utils.types import Array, LabelMap, Mask
 from .registration import _features, _refine, _score
-from ..utils import ValidRegion, to_gray, warp_labels
+from .results import MatchResult
 
 
-def anchor_vectors(labels, valid, class_id):
+def anchor_vectors(labels: LabelMap, valid: Mask, class_id: int) -> list[Array]:
     """Estimate near-axis periods from repeated connected anchor components.
 
     Skewed/rotated lattices can instead use explicit period_vectors. Image
@@ -38,12 +44,13 @@ def anchor_vectors(labels, valid, class_id):
     return vectors
 
 
-def complete_periodic(result, labels, annotation_valid, source_valid, target_valid, cfg):
+def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: Mask,
+                      source_valid: Mask, target_valid: Mask, cfg: MatcherConfig) -> None:
     source, target = result.template_image, result.input_image
     H = result.matrix_template_to_target
     h, w = target.shape[:2]
     best = result.registration['matches'][result.registration['ranking'][0]]
-    scale = min(1., cfg.max_side/max(*source.shape[:2], h, w))
+    scale = cfg.matching_scale(source.shape, target.shape)
     ss = (round(source.shape[1]*scale), round(source.shape[0]*scale))
     ts = (round(w*scale), round(h*scale))
     Da = np.diag([ss[0]/source.shape[1], ss[1]/source.shape[0], 1.])
@@ -73,7 +80,7 @@ def complete_periodic(result, labels, annotation_valid, source_valid, target_val
                 direct_label_pixels=int(result.label_valid.sum()), target_valid_pixels=total)
     result.registration['periodic_completion'] = info
 
-    def finish(status=None):
+    def finish(status: str | None = None) -> None:
         missing = int((target_valid & ~result.label_valid).sum())
         info.update(status=status or ('complete' if missing == 0 else 'incomplete'),
                     label_coverage_roi=float(result.label_valid.sum()/total),
@@ -101,7 +108,7 @@ def complete_periodic(result, labels, annotation_valid, source_valid, target_val
         P[:2, 2] = shift
         candidate = H @ P
         # Skip candidates unable to supply any currently unknown annotation.
-        _, ann = warp_labels(labels, candidate, target.shape, annotation_valid)
+        ann = warp_valid_mask(annotation_valid, candidate, target.shape)
         if not (ann & target_valid & ~result.label_valid).any():
             continue
         work = Db @ candidate @ np.linalg.inv(Da)
@@ -149,7 +156,7 @@ def complete_periodic(result, labels, annotation_valid, source_valid, target_val
         result.mapped_labels[fill_labels] = mapped[fill_labels]
         result.label_valid |= fill_labels
         result.label_periodic_valid |= fill_labels
-        _, geom = warp_labels(labels, candidate, target.shape, source_valid)
+        geom = warp_valid_mask(source_valid, candidate, target.shape)
         fill_image = geom & target_valid & ~result.completed_valid & approved
         warped = cv2.warpPerspective(source, candidate, (w, h))
         result.completed_template[fill_image] = warped[fill_image]

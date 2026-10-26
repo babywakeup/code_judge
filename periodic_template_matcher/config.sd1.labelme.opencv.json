@@ -1,4 +1,4 @@
-﻿{
+{
   "target": "../source/SD-1/10-21/Tlink-Image-1792571352308_defect.jpeg",
   "target_valid_height": 1891,
   "templates": [
@@ -7,30 +7,50 @@
       "valid_height": 1891,
       "image": "../source/SD-1/10-21/Tlink-Image-1792571258237.jpeg",
       "labelme": "../source/SD-1/10-21/Tlink-Image-1792571258237.json",
-      "class_map": {"1": 1}
+      "class_map": {
+        "1": 1
+      }
     },
     {
       "name": "SD1_1371308",
       "valid_height": 1891,
       "image": "../source/SD-1/10-21/Tlink-Image-1792571371308.jpeg",
       "labelme": "../source/SD-1/10-21/Tlink-Image-1792571371308.json",
-      "class_map": {"1": 1}
+      "class_map": {
+        "1": 1
+      }
     }
   ],
   "label_mode": "semantic",
   "demo_annotations": false,
   "options": {
-    "backend": "opencv",
-    "periodic_completion": true,
-    "max_side": 800,
-    "angles": [-2, 0, 2],
-    "scales": [0.97, 1.0, 1.03],
-    "bottom_ignore_fraction": 0.08,
-    "min_overlap": 0.45,
-    "min_score": 60,
-    "min_template_gap": 3,
-    "refine_candidates": 8,
-    "ecc_iterations": 70
+    "step1": {
+      "description": "预处理：设置有效区域，统一缩放模板和输入图像；scale 为 null 时根据 max_side 自动计算倍率。",
+      "max_side": 800,
+      "scale": null,
+      "bottom_ignore_fraction": 0.08
+    },
+    "step2": {
+      "description": "粗匹配：在缩放后的图像上枚举模板的 angles 和 scales 组合，搜索平移位置并生成候选。",
+      "backend": "opencv",
+      "angles": [
+        0
+      ],
+      "scales": [
+        1.0
+      ]
+    },
+    "step3": {
+      "description": "精配准与判定：使用 ECC 优化候选，根据重叠率、分数和候选差距判定结果，最终变换换算回原图坐标。",
+      "min_overlap": 0.45,
+      "min_score": 60,
+      "min_template_gap": 3,
+      "refine_candidates": 8,
+      "ecc_iterations": 70
+    },
+    "periodic": {
+      "description": "周期补全：利用重复周期结构和相似度验证补全未覆盖区域，保留已有直接映射标签。",
+      "periodic_completion": true
+    }
   }
 }
-

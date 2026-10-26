@@ -1,12 +1,16 @@
 """Support ``python -m periodic_template_matcher``."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from pathlib import Path
 import argparse
 import json
-from pathlib import Path
 
 from ._internal.workflow import run_config
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description='Periodic template registration and segmentation transfer')
     parser.add_argument('--config', required=True, help='UTF-8 JSON config; paths relative to that JSON')
     parser.add_argument('--out', required=True)

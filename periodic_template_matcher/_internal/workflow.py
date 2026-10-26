@@ -1,18 +1,23 @@
 """Configuration, duplicate handling, annotation transfer and report artifacts."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from pathlib import Path
 import hashlib
 import json
-from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .annotations import demo_labels, load_labels
 from ..config import MatcherConfig
 from ..matcher import PeriodicTemplateMatcher
-from ..utils import (build_valid_mask, overlay_labels, read_image, to_gray,
+from ..utils import (build_valid_mask, overlay_labels, read_image,
                      warp_labels, write_image)
-from .visual_report import build_report
+from ..utils.types import Diagnostics, PathInput, Resolver
+from .annotations import demo_labels, load_labels
 from .periodic_report import ARTIFACTS as COMPLETION_ARTIFACTS, export_completion
+from .visual_report import build_report
 
 
 ARTIFACTS = (
@@ -23,7 +28,9 @@ ARTIFACTS = (
 ) + COMPLETION_ARTIFACTS
 
 
-def unique_templates(specs, resolve):
+def unique_templates(
+    specs: Sequence[Diagnostics], resolve: Resolver,
+) -> tuple[list[Diagnostics], list[list[Diagnostics]]]:
     """Collapse identical image files; conflicting labels/ROIs must be resolved."""
     unique, aliases, seen = [], [], {}
     for index, item in enumerate(specs):
@@ -45,16 +52,16 @@ def unique_templates(specs, resolve):
     return unique, aliases
 
 
-def run_config(config_path, output_dir):
+def run_config(config_path: PathInput, output_dir: PathInput) -> Diagnostics:
     config_path, out = Path(config_path).resolve(), Path(output_dir).resolve()
     spec = json.loads(config_path.read_text(encoding='utf-8-sig'))
 
-    def resolve(value):
+    def resolve(value: str) -> Path:
         return (config_path.parent / value).resolve()
 
     options = dict(spec.get('options', {}))
-    options['label_mode'] = spec.get('label_mode', 'semantic')
-    cfg = MatcherConfig(**options)
+    cfg = MatcherConfig.from_options(options)
+    cfg.label_mode = spec.get('label_mode', cfg.label_mode)
     cfg.validate()
     specs, aliases = unique_templates(spec['templates'], resolve)
     images = [read_image(resolve(s['image'])) for s in specs]
@@ -64,15 +71,9 @@ def run_config(config_path, output_dir):
     tv = read_image(resolve(spec['target_valid_mask']), cv2.IMREAD_GRAYSCALE) if spec.get('target_valid_mask') else None
     # Validate even non-selected annotations, so a bad template cannot hide silently.
     labels = [load_labels(s, resolve, im.shape[:2]) for s, im in zip(specs, images)]
-    annotation_valids = []
-    for s, im, valid in zip(specs, images, valids):
-        vm = build_valid_mask(to_gray(im), valid, cfg, s.get('valid_height'))
-        if s.get('annotation_valid'):
-            ann = read_image(resolve(s['annotation_valid']), cv2.IMREAD_GRAYSCALE)
-            if ann.shape != vm.shape:
-                raise ValueError('annotation_valid must match the template')
-            vm &= (ann > 0).astype(np.uint8)
-        annotation_valids.append(vm)
+    # Annotation knowledge and image ROI are intersected once inside match().
+    annotation_valids = [read_image(resolve(s['annotation_valid']), cv2.IMREAD_GRAYSCALE)
+                        if s.get('annotation_valid') else None for s in specs]
     matched = PeriodicTemplateMatcher(cfg).match(images, labels, target,
                                                 template_valids=valids,
                                                 annotation_valids=annotation_valids,
@@ -112,10 +113,8 @@ def run_config(config_path, output_dir):
     if H is not None:
         H = np.asarray(H)
         warped = matched.warped_template
-        vm = build_valid_mask(to_gray(image), valids[idx], cfg, specs[idx].get('valid_height'))
+        vm = build_valid_mask(image, valids[idx], cfg, specs[idx].get('valid_height'))
         geometric_valid = matched.geometric_valid
-        tm = build_valid_mask(to_gray(target), tv, cfg, spec.get('target_valid_height')) > 0
-        geometric_valid &= tm
         blend = target.copy()
         blend[geometric_valid] = cv2.addWeighted(target, .5, warped, .5, 0)[geometric_valid]
         views.update(warped=warped, valid=geometric_valid, blend=blend)
@@ -139,13 +138,17 @@ def run_config(config_path, output_dir):
                 write_image(out / 'label_valid.png', valid.astype(np.uint8) * 255)
                 overlay = overlay_labels(target, mapped, valid)
                 write_image(out / 'label_overlay.jpg', overlay)
-                views.update(label_source=overlay_labels(image, labels[idx], annotation_valids[idx] > 0),
+                known = vm > 0
+                if annotation_valids[idx] is not None:
+                    known &= annotation_valids[idx] > 0
+                views.update(label_source=overlay_labels(image, labels[idx], known),
                              label_target=overlay)
                 result.update(labels_exported=True, label_coverage_full_image=float(valid.mean()),
                               mapped_class_ids=np.unique(mapped[valid]).tolist())
         else:
             result['warnings'].append('所选模板没有真实分割标注；未生成正式 mapped_labels / label_valid。')
             if spec.get('demo_annotations', False):
+                tm = build_valid_mask(target, tv, cfg, spec.get('target_valid_height')) > 0
                 source = demo_labels(image.shape[:2])
                 mapped, valid = warp_labels(source, H, target.shape, vm)
                 valid &= tm

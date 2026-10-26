@@ -1,13 +1,17 @@
 """Read class-ID masks or explicitly class-mapped LabelMe segmentation shapes."""
+
+from __future__ import annotations
+
 import json
 
 import cv2
 import numpy as np
 
 from ..utils import read_image
+from ..utils.types import Diagnostics, LabelMap, Resolver, Shape
 
 
-def load_labels(spec, resolve, shape):
+def load_labels(spec: Diagnostics, resolve: Resolver, shape: Shape) -> LabelMap | None:
     """None means absent, never a generated annotation. Last shape wins overlaps.
 
     LabelMe unpainted pixels are background (0). For partial annotations supply
@@ -52,7 +56,7 @@ def load_labels(spec, resolve, shape):
     return labels
 
 
-def demo_labels(shape):
+def demo_labels(shape: Shape) -> LabelMap:
     """Artificial shapes for transport illustration, NOT product segmentation."""
     h, w = shape
     labels = np.zeros(shape, np.uint16)

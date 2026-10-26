@@ -1,9 +1,16 @@
 """Original-coordinate valid-region policy shared by all matcher stages."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isfinite
 
-import numpy as np
 import cv2
+import numpy as np
+
+from ..config import MatcherConfig
+from .types import Diagnostics, Image, Mask, Size
 
 
 @dataclass(frozen=True)
@@ -18,11 +25,11 @@ class ValidRegion:
     bottom_ignore_fraction: float = 0.
 
     @classmethod
-    def from_config(cls, config, valid_height=None):
+    def from_config(cls, config: MatcherConfig, valid_height: int | None = None) -> ValidRegion:
         height = config.valid_height if valid_height is None else valid_height
         return cls(height, config.bottom_ignore_fraction)
 
-    def resolved_height(self, image):
+    def resolved_height(self, image: Image) -> int:
         if not isinstance(image, np.ndarray) or image.ndim not in (2, 3) or min(image.shape[:2]) < 1:
             raise ValueError('ValidRegion requires a nonempty image array')
         height = image.shape[0]
@@ -36,7 +43,7 @@ class ValidRegion:
             return self.valid_height
         return int(height*(1-self.bottom_ignore_fraction))
 
-    def build_mask(self, image, mask=None):
+    def build_mask(self, image: Image, mask: Mask | None = None) -> Mask:
         """Return a new HxW uint8 image ROI, never annotation knowledge."""
         end = self.resolved_height(image)
         if mask is None:
@@ -50,12 +57,12 @@ class ValidRegion:
             raise ValueError('Too few valid image pixels')
         return out
 
-    def crop(self, image):
+    def crop(self, image: Image) -> Image:
         """Return a top-row image copy; optional convenience for external callers."""
         return image[:self.resolved_height(image)].copy()
 
     @staticmethod
-    def resize_for_matching(gray, mask, size):
+    def resize_for_matching(gray: Image, mask: Mask, size: Size) -> tuple[Image, Mask]:
         """Downsample using only valid pixels, even across fractional ROI borders.
 
         Returns (uint8 gray, uint8 mask). Multiplication happens before resize,
@@ -71,7 +78,7 @@ class ValidRegion:
         resized_mask &= (denominator > 1e-6).astype(np.uint8)
         return np.clip(np.rint(resized), 0, 255).astype(np.uint8), resized_mask
 
-    def describe(self, image, mask):
+    def describe(self, image: Image, mask: Mask) -> Diagnostics:
         """JSON-safe record of the resolved image region, including mask holes."""
         return dict(image_height=int(image.shape[0]), image_width=int(image.shape[1]),
                     valid_height=self.resolved_height(image), valid_pixels=int(mask.sum()),

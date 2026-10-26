@@ -1,9 +1,16 @@
 """OpenCV coarse translation search with masked, partial-overlap normalization."""
+
+from __future__ import annotations
+
 import cv2
 import numpy as np
 
+from ..config import MatcherConfig
+from ..utils.types import Array, Mask
 
-def translation_peaks(source, target, sm, tm, cfg):
+
+def translation_peaks(source: Array, target: Array, sm: Mask, tm: Mask,
+                      cfg: MatcherConfig) -> list[tuple[float, float, float]]:
     """Return (merit, dx, dy) peaks mapping source into target coordinates.
 
     Zero padding exposes every signed shift with at least one overlapping pixel.
@@ -20,7 +27,7 @@ def translation_peaks(source, target, sm, tm, cfg):
     if not sm.any() or not tm.any():
         return []
 
-    def correlate(image, kernel):
+    def correlate(image: Array, kernel: Array) -> Array:
         padded = cv2.copyMakeBorder(image, sh - 1, sh - 1, sw - 1, sw - 1,
                                     cv2.BORDER_CONSTANT, value=0)
         return cv2.matchTemplate(padded, kernel, cv2.TM_CCORR)

@@ -329,3 +329,58 @@ matcher.visualize(evaluated, "evaluation_check.jpg")
 `example_real_pair`包含用户提供图一→图二的历史实测结果与叠加图：score约75.02，有效覆盖约82.5%，识别到周期结构，绝对周期编号未验证。当前已有第二张模板，但尚无真实分割标注，因此真实标注边界精度仍未验收。合成例子的标签仅用于演示软件流程，不是产线标注。
 
 模块职责见上方结构表。[包结构测试](../tests/test_package.py) 额外验证公开类型身份一致、无关顶层同名模块不干扰包导入、模块命令行启动、旧模块已删除及参数转发。无需额外 GUI 或网页框架依赖。
+
+## 匹配分辨率
+
+在 JSON 的 `options` 中设置 `"scale": 0.5`，即可将所有模板和输入图像的宽高按同一倍率缩小后匹配，FFT、OpenCV 以及周期补全均使用此设置。
+
+- `"scale": null`（默认或省略）：按 `max_side` 自动计算倍率，最长边不超过该值，不放大。
+- `"scale": 1.0`：使用原始分辨率。
+- `"scale": 0.5`：宽高各为原图的一半；有效范围为 `0 < scale <= 1`。
+
+显式设置 `scale` 时覆盖 `max_side`。`scales` 仍用于搜索模板相对输入的尺寸变化，与此参数独立。缩小可能损失细节、影响匹配分数；最终变换矩阵、标签和输出坐标仍对应原始图像。若缩放后任一图像的宽或高小于 32 像素，匹配会报错。
+
+## 配置分组
+
+`options` 按处理阶段组织，三个 SD-1 配置均已采用此结构：
+
+```json
+"options": {
+  "step1": {"scale": null, "max_side": 800, "bottom_ignore_fraction": 0.08},
+  "step2": {"backend": "opencv", "angles": [-2, 0, 2], "scales": [0.97, 1.0, 1.03]},
+  "step3": {"refine_candidates": 8, "ecc_iterations": 70, "min_overlap": 0.45, "min_score": 60, "min_template_gap": 3},
+  "periodic": {"periodic_completion": true}
+}
+```
+
+| 分组 | 参数与作用 |
+| --- | --- |
+| `step1` | 预处理：`scale`、`max_side`、`bottom_ignore_fraction`、默认 `valid_height` |
+| `step2` | 粗匹配：`backend`、`angles`、`scales`、`peaks_per_hypothesis`、`seed` |
+| `step3` | 精配准与判定：`refine_candidates`、`ecc_iterations`、`edge_tolerance_px`、`min_overlap`、`min_score`、`min_template_gap`、`min_candidate_gap` |
+| `periodic` | 周期补全：`periodic_completion`、`period_vectors`、`periodic_anchor_class`、`periodic_max_steps`、`periodic_min_ncc`、`periodic_min_edge` |
+| `evaluation` | 标签策略与评估：`label_mode`、`include_background` |
+
+分组用于组织配置；`min_overlap` 等共享阈值也会影响粗匹配筛选。图像路径、每张图像的有效高度和标注仍位于原有位置；顶层 `label_mode` 若存在则优先于 `options.evaluation.label_mode`。
+旧的平铺 `options` 仍可读取，但同一参数不能重复出现在平铺与分组中，分组内放错参数也会报错。Python 构造函数仍使用 `MatcherConfig(scale=0.5, ...)`；读取分组字典使用 `MatcherConfig.from_options(options)`。结果报告中的 `config` 仍保存实际生效的平铺参数。
+
+各配置分组可添加字符串 `description` 说明用途；读取配置时会忽略该字段，不影响匹配参数。
+
+## 推理代码与类型标注
+
+函数参数和返回值均有类型标注，数组约定集中在 `utils/types.py`：
+
+| 类型 | 数据约定 |
+| --- | --- |
+| `Image` | `uint8` 原图，形状为 `(H, W)` 或 `(H, W, 3/4)`，彩色通道为 BGR/BGRA |
+| `LabelInput` | 二维整数类别图，或同一图像各类别的二值掩码序列 |
+| `LabelMap` | 规范化后的 `(H, W)`、`uint16` 类别图 |
+| `Mask` / `BoolMask` | 有效区域或二值类别掩码；布尔输出以 `True` 表示有效 |
+| `Matrix` | `3×3 float64` 变换矩阵；公开结果将模板原图坐标映射到 input 原图坐标 |
+| `Shape` / `Size` | 分别为 `(高度, 宽度)` 和 OpenCV 的 `(宽度, 高度)` |
+
+图像读写函数也支持 `uint16` 标签图，因此使用通用数组类型 `Array` 标注。类型标注便于 IDE 跳转与提示，数据尺寸和值域仍由运行时校验。
+
+配准流程按职责拆分：`_prepare_image()` 生成工作分辨率特征，`_coarse_candidates()` 搜索粗匹配候选，`_refine_candidates()` 执行 ECC 精配准，`_register_prepared()` 汇总判定结果。多模板选择时，input 的预处理和周期检测只做一次，并供所有模板复用。
+
+`matcher.match()` 负责输入与 ROI 准备、调用模板选择、迁移标签以及可选的周期补全。`warp_valid_mask()` 直接投影有效区域，无需创建一张全零标签图。`workflow.run_config()` 负责配置、文件读写与报告导出。

@@ -1,14 +1,30 @@
 """Matcher configuration and validation, without matching or file IO logic."""
-from dataclasses import dataclass
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass, fields
 from math import isfinite
+from typing import Any
+
+
+OPTION_GROUPS = {
+    'step1': {'scale', 'max_side', 'bottom_ignore_fraction', 'valid_height'},
+    'step2': {'backend', 'angles', 'scales', 'peaks_per_hypothesis', 'seed'},
+    'step3': {'refine_candidates', 'ecc_iterations', 'edge_tolerance_px',
+              'min_overlap', 'min_score', 'min_template_gap', 'min_candidate_gap'},
+    'periodic': {'periodic_completion', 'period_vectors', 'periodic_anchor_class',
+                 'periodic_max_steps', 'periodic_min_ncc', 'periodic_min_edge'},
+    'evaluation': {'label_mode', 'include_background'},
+}
 
 
 @dataclass
 class MatcherConfig:
     """Registration parameters, identity policy and segmentation evaluation."""
 
-    angles: tuple = (-2.0, 0.0, 2.0)
-    scales: tuple = (0.97, 1.0, 1.03)
+    angles: Sequence[float] = (-2.0, 0.0, 2.0)
+    scales: Sequence[float] = (0.97, 1.0, 1.03)
     max_side: int = 800
     peaks_per_hypothesis: int = 4
     refine_candidates: int = 5
@@ -25,13 +41,50 @@ class MatcherConfig:
     include_background: bool = False
     backend: str = 'fft'
     periodic_completion: bool = False
-    period_vectors: tuple = ()  # Optional source-original pixel lattice vectors.
+    period_vectors: Sequence[Sequence[float]] = ()  # Optional source-original pixel lattice vectors.
     periodic_anchor_class: int = 1
     periodic_max_steps: int = 2
     periodic_min_ncc: float = .75
     periodic_min_edge: float = .6
+    scale: float | None = None  # Shared working resolution; None uses max_side.
 
-    def validate(self):
+    @classmethod
+    def from_options(cls, options: dict[str, Any]) -> MatcherConfig:
+        """Read grouped JSON options while accepting legacy flat parameters."""
+        if not isinstance(options, dict):
+            raise ValueError('options must be an object')
+        flat = {}
+        names = {field.name for field in fields(cls)}
+        for key, value in options.items():
+            if key in OPTION_GROUPS:
+                if not isinstance(value, dict):
+                    raise ValueError(f'options.{key} must be an object')
+                entries = value.items()
+            elif key in names:
+                entries = [(key, value)]
+            else:
+                raise ValueError(f'Unknown options key: {key}')
+            for name, setting in entries:
+                if key in OPTION_GROUPS and name == 'description':
+                    continue  # Human-readable group documentation, not a matcher parameter.
+                if key in OPTION_GROUPS and name not in OPTION_GROUPS[key]:
+                    raise ValueError(f'Parameter {name} does not belong in options.{key}')
+                if name in flat:
+                    raise ValueError(f'Duplicate options parameter: {name}')
+                flat[name] = setting
+        cfg = cls(**flat)
+        cfg.validate()
+        return cfg
+
+    def matching_scale(self, *shapes: Sequence[int]) -> float:
+        """Choose one nominal scale for all template and input image shapes."""
+        return self.scale if self.scale is not None else min(
+            1.0, self.max_side / max(max(shape[:2]) for shape in shapes))
+
+    def validate(self) -> None:
+        if self.scale is not None and (type(self.scale) not in (int, float)
+                                      or not isfinite(self.scale) or not 0 < self.scale <= 1):
+            raise ValueError('scale must be finite in (0, 1] or None')
         if self.valid_height is not None and (type(self.valid_height) is not int or self.valid_height < 1):
             raise ValueError('valid_height must be a positive integer or None')
         if not isinstance(self.periodic_completion, bool):

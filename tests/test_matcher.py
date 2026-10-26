@@ -17,6 +17,62 @@ from tests.helpers import texture
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_valid_mask_projection_preserves_holes_and_target_bounds(self):
+        from periodic_template_matcher.utils import warp_valid_mask
+        mask = np.ones((3, 4), np.uint8)
+        mask[1, 1] = 0
+        H = np.array([[1., 0, 2], [0, 1., 1], [0, 0, 1.]])
+        actual = warp_valid_mask(mask, H, (5, 5))
+        expected = np.zeros((5, 5), bool)
+        expected[1:4, 2:5] = True
+        expected[2, 3] = False
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(mask, [[1, 1, 1, 1], [1, 0, 1, 1], [1, 1, 1, 1]])
+
+    def test_multiple_templates_share_target_features_and_period_detection(self):
+        from periodic_template_matcher._internal import registration
+        source = texture()
+        with patch.object(registration, '_features', wraps=registration._features) as features:
+            with patch.object(registration, '_periods', wraps=registration._periods) as periods:
+                result = select_templates([source, texture(99)], source, self.cfg)
+        self.assertEqual(result['ranking'][0], 0)
+        self.assertEqual(features.call_count, 3)  # Two templates and one target.
+        self.assertEqual(periods.call_count, 1)
+
+    def test_shared_preprocessing_matches_standalone_with_mixed_sizes(self):
+        templates = [texture(), texture(99)[:140, :180]]
+        target = texture()
+        cfg = MatcherConfig(max_side=150, angles=(0.,), scales=(1.,))
+        ranked = select_templates(templates, target, cfg)
+        for index, template in enumerate(templates):
+            direct = register(template, target, cfg, working_scale=.75)
+            match = ranked['matches'][index]
+            self.assertAlmostEqual(match['match_score'], direct['match_score'], places=7)
+            self.assertEqual(match['working_target_size'], [150, 120])
+            np.testing.assert_allclose(match['matrix_template_to_target'],
+                                       direct['matrix_template_to_target'], atol=1e-7)
+
+    def test_explicit_scale_overrides_max_side_for_both_backends(self):
+        source = texture()
+        for backend in ('fft', 'opencv'):
+            for scale, size in ((1., [200, 160]), (.5, [100, 80])):
+                with self.subTest(backend=backend, scale=scale):
+                    cfg = MatcherConfig(scale=scale, max_side=96, backend=backend,
+                                        angles=(0.,), scales=(1.,))
+                    direct = register(source, source, cfg)
+                    ranked = select_templates([source], source, cfg)['matches'][0]
+                    for result in (direct, ranked):
+                        self.assertEqual(result['working_scale'], scale)
+                        self.assertEqual(result['working_target_size'], size)
+                        self.assertTrue(result['geometry_accepted'])
+                        np.testing.assert_allclose(result['matrix_template_to_target'],
+                                                   np.eye(3), atol=.1)
+
+    def test_scale_validation(self):
+        for scale in (0, -.5, 1.1, float('nan'), float('inf'), True, '0.5'):
+            with self.subTest(scale=scale), self.assertRaisesRegex(ValueError, 'scale'):
+                MatcherConfig(scale=scale).validate()
+
     def setUp(self):
         self.cfg = MatcherConfig(max_side=200, angles=(0.,), scales=(1.,),
                           refine_candidates=3, peaks_per_hypothesis=3, ecc_iterations=35)
