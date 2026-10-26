@@ -1,8 +1,110 @@
 # 周期结构多模板配准与分割标注映射
 
+## 匹配后端选择
+
+在 JSON 的 `options` 中设置 `"backend": "fft"` 或 `"backend": "opencv"`。
+省略时默认 `fft`，保留原有行为；Python API 对应 `MatcherConfig(backend='opencv')`。
+
+- `fft`：原有 FFT 线性相关位移搜索。
+- `opencv`：使用 `cv2.matchTemplate(..., cv2.TM_CCORR)` 计算相关、有效重叠和能量，
+  再按真实有效交集归一化。补边支持同尺寸图像的正负位移和部分重叠，补边不计入有效面积。
+
+两个后端共用角度/缩放枚举、多个候选、ECC 仿射精配准、最终评分、接受条件及标签迁移。
+OpenCV 后端替换粗搜索；两个后端都可启用下述周期补齐，计算耗时依图像和搜索范围而异。
+报告 `result.json` 的 `config.backend` 记录实际配置。
+
+```powershell
+# OpenCV 后端：同一批 SD-1 图像，输出到独立目录
+.\.venv\Scripts\python.exe -m periodic_template_matcher --config periodic_template_matcher/config.sd1.labelme.opencv.json --out periodic_template_matcher/results/sd1_labelme_defect_opencv
+```
+
 本代码比较两张或多张模板与同一目标图的匹配程度，给出0—100的match score、排序和变换矩阵，并将选中模板的类别掩码映射到目标图。
 
-这是可运行的传统视觉基线，采用结构归一化、线性相关多候选、仿射ECC精配准和统一质量评分。支持重复模板去重、PNG / LabelMe 分割标注、离线中文交互报告及六宫格总览。它尚未实现局部非刚性变形、设备坐标标定或周期标签自动外推。现场精度需要用真实标注验证。
+这是可运行的传统视觉基线，采用结构归一化、线性相关多候选、仿射ECC精配准和统一质量评分。支持重复模板去重、PNG / LabelMe 分割标注、离线中文交互报告及六宫格总览。支持可选的周期标签补齐，尚未实现局部非刚性变形或设备坐标标定。现场精度需要用真实标注验证。
+
+## 匹配前设置有效高度
+
+模板和 input 的底部文字可以通过原图像素高度排除：
+
+```json
+{
+  "target": "input.jpeg",
+  "target_valid_height": 1891,
+  "templates": [
+    {"image": "template_A.jpeg", "valid_height": 1891},
+    {"image": "template_B.jpeg", "valid_height": 1850}
+  ],
+  "options": {"valid_height": 1891}
+}
+```
+
+H=1891 表示有效行是 `[0, 1891)`，第 1891 行及之后不参与匹配。
+优先级为：每张图的显式高度 > `options.valid_height` 公共默认高度 >
+`bottom_ignore_fraction`。显式高度覆盖比例设置，不叠加裁剪；所有情况仍与已有图像 mask 取交集。
+高度必须为正整数且不超过对应图像高度，有效像素不足时会明确报错。
+
+实现集中在 `utils/regions.py` 的 `ValidRegion` 类中：
+
+- `resolved_height(image)`：解析有效 H。
+- `build_mask(image, mask=None)`：构造原图大小的 0/1 mask，与额外 mask 取交集。
+- `resize_for_matching(gray, mask, size)`：仅用有效像素加权缩小，避免文字在缩放边界混入。
+- `crop(image)`：可选的外部裁切便利方法；正式 matcher 保留原图画布和坐标。
+- `describe(image, mask)`：生成可检查的高度和有效像素统计。
+
+Matcher 的 `_prepare_regions()` 在提取特征前统一解析图像 ROI，之后复用于配准、标签迁移、
+周期补齐及评价。标注有效范围 `annotation_valid` 与图像有效范围分别处理。
+输出图像和 mask 保持原始 input 尺寸；无效底部的 `label_valid` 始终为 0。
+`result.json.valid_regions` 和 HTML 报告会记录每张图的最终有效 H。
+
+```python
+from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher
+from periodic_template_matcher.utils import ValidRegion
+
+region = ValidRegion(valid_height=1891)
+valid_mask = region.build_mask(image)
+matcher = PeriodicTemplateMatcher(MatcherConfig(valid_height=1891))
+result = matcher.match(
+    templates, labels, input_image,
+    template_valid_heights=[1891, 1850],
+    target_valid_height=1891,
+)
+# evaluate() 同样支持 template_valid_heights 和 target_valid_height。
+```
+
+## 周期补齐与完整 ROI 预测
+
+在 `options` 中设置 `"periodic_completion": true`，匹配接受且有语义标注后执行补齐。
+SD-1 的两份 LabelMe 配置已经启用；通用 API 默认关闭，以保留原有行为。
+
+周期来源优先级：`period_vectors` 显式配置、`periodic_anchor_class`（默认 1）的重复
+连通区域、input 图像自相关。标注锚点自动估计适用于接近水平/垂直的重复排列；倾斜晶格可显式
+提供一至两个模板原图坐标向量，如 `"period_vectors": [[875, 1], [-2, 874]]`。
+显式向量需要独立且非零。算法不读取目标 LabelMe 真值来指导预测。
+
+先保留直接配准，再生成整数周期副本，只处理有机会提供未知标签的候选。每个候选进行 ECC
+校正和图像验证，校正幅度受周期约束；默认要求结构 NCC >= 0.75、边缘评分 >= 0.6。
+还会对每个待新增连通区域及其有限邻域单独验证，避免内部大面积重合掩盖边缘不匹配。
+通过后，以最近邻迁移类别和 annotation_valid，填充背景与前景，保留类别 ID 和直接预测。
+`periodic_max_steps` 默认 2（范围 1..5），限定每个周期方向的复制步数，避免无界搜索。
+
+API 的 `mapped_labels` / `label_valid` 为最终预测；`geometric_valid` / `warped_template`
+仍是直接配准。新增 `completed_template`、`completed_valid`、`periodic_valid`、
+`label_periodic_valid` 分别表示补齐图像、补齐几何范围、图像补齐区和标签补齐区。
+未执行周期补齐时这些新增字段为 None。仅在 semantic 模式补齐，不复制唯一实例编号。
+
+输出新增：
+
+- `periodic_overlay.html`：离线查看 input 与模板，直接区和周期补齐区分别调透明度。
+- `completed_alignment.jpg`：补齐后的 50% 叠加。
+- `completed_geometric_valid.png` / `periodic_valid.png`：最终图像范围 / 周期新增范围。
+- `label_periodic_valid.png`：最终 mask 中由周期补齐的像素。
+- `completion_regions.jpg`：绿色为直接配准，橙色为周期补齐。
+
+`result.json.periodic_completion` 记录来源、周期向量、每个副本的变换和评分、
+`label_coverage_roi`、`remaining_unknown_pixels` 以及 complete/incomplete/no_period 状态。
+100% 覆盖表示 ROI 内每个像素都有类别预测（包括背景），不表示前景覆盖整图或 100% 准确率。
+无可靠周期、验证失败或源标注不完整时保持未知并报告原因。局部标注必须配置 annotation_valid，
+否则 LabelMe 未画区域按既有约定视为已知背景。底部排除区域始终不参与补齐。
 
 ## 本次 SD-1 图片：直接看结果
 
@@ -149,9 +251,9 @@ score = 100 × (0.55 × structure_ncc
 
 `result.json` 中 `labels_exported`、`annotation_status`、`demo_labels_exported` 区分真实标签和示意。`template_aliases` 保留原始模板条目与去重候选的映射；`best_template_index` 是去重候选索引。
 
-报告在匹配被拒绝时仍显示最高分候选及拒绝状态，用于排查，不能将可视化预览误当成已接受结果。差异热图只是局部归一化后的图像差异，不是缺陷分割。底部排除区与没有源模板支持的区域均保持未知，不自动补齐。
+报告在匹配被拒绝时仍显示最高分候选及拒绝状态，用于排查，不能将可视化预览误当成已接受结果。差异热图只是局部归一化后的图像差异，不是缺陷分割。底部排除区保持未知；其他未覆盖区域仅在启用周期补齐且验证通过时填充。
 
-本版本只迁移模板已有标注，不会把标注自动铺满未覆盖的周期。图一、图二裁切不同会留下未覆盖区域，这是正确的未知区域处理。
+默认只迁移模板已有标注；启用周期补齐后，可使用验证通过的周期副本补齐裁切差异造成的未知区域。
 
 `edge_distance_p95_work_px`是图像边缘间距离的诊断值，单位为工作分辨率像素，不是人工标注误差，也不能代替对Short所需精度的验收。
 
@@ -216,7 +318,7 @@ matcher.visualize(evaluated, "evaluation_check.jpg")
 - `input_valid=False` 的真值像素不参与指标。目标匹配 ROI 和底部排除区也不参与指标。
 - 匹配被拒绝时 `status=match_rejected`，无模板标注时 `status=no_template_annotations`，没有有效真值时 `status=no_valid_ground_truth`；这些情况 `score=None`，不伪造为 0 或满分。
 - 默认不计背景且预测/真值全为背景时，前景 mIoU/Dice/score 为 `None`，像素准确率仍可为 1；如需背景分，显式开启 `include_background=True`。
-- 周期图在 `instance` 模式下仍会被身份保护拒绝，不能绕过匹配门限计算正式预测分。所有模式均不自动外推未覆盖周期。
+- 周期图在 `instance` 模式下仍会被身份保护拒绝，不能绕过匹配门限计算正式预测分。周期补齐仅用于通过匹配的 semantic 模式。
 
 [可运行示例](../examples/matcher_demo.py) 自动生成有已知变换和两类标注的**合成**图，调用评估并保存检查图、预测标签、有效范围及指标 JSON；无需额外输入。它验证 API 流程，不代表产线精度。
 

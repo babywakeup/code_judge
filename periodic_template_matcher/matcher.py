@@ -1,5 +1,6 @@
 """Public array API: select templates, transfer labels, evaluate and inspect."""
 from copy import deepcopy
+from dataclasses import asdict, replace
 
 import cv2
 import numpy as np
@@ -7,8 +8,9 @@ import numpy as np
 from .config import MatcherConfig
 from ._internal.evaluation import evaluate_segmentation
 from ._internal.registration import select_templates
+from ._internal.periodic_completion import complete_periodic
 from ._internal.results import EvaluationResult, MatchResult
-from .utils import build_valid_mask, normalize_masks, to_gray, warp_labels
+from .utils import ValidRegion, normalize_masks, to_gray, warp_labels
 from ._internal.visual_report import visualize_match
 
 
@@ -39,11 +41,13 @@ class PeriodicTemplateMatcher:
         return values
 
     def match(self, templates, masks, input, *, template_valids=None,
-              annotation_valids=None, target_valid=None) -> MatchResult:
+              annotation_valids=None, target_valid=None,
+              template_valid_heights=None, target_valid_height=None) -> MatchResult:
         """Select a template and transfer its labels only on accepted matches.
 
         template_valids/target_valid limit image ROI. annotation_valids mark
-        known template labels; zero is otherwise known background.
+        known template labels; zero is otherwise known background. Explicit valid
+        heights are original-pixel top-row counts, overriding default exclusions.
         """
         self.config.validate()
         if not isinstance(templates, (list, tuple)) or not templates:
@@ -59,8 +63,13 @@ class PeriodicTemplateMatcher:
         valids = self._valids(template_valids, templates, 'template_valids')
         annotations = self._valids(annotation_valids, templates, 'annotation_valids')
         self._valids([target_valid], [input], 'target_valid')
-        registration = select_templates(templates, input, self.config, valids,
-                                        target_valid, self.config.label_mode)
+        valids, target_mask, regions = self._prepare_regions(
+            templates, input, valids, target_valid, template_valid_heights, target_valid_height)
+        # Heights and masks are already resolved. Do not exclude rows a second time.
+        registration_config = replace(self.config, valid_height=None, bottom_ignore_fraction=0.)
+        registration = select_templates(templates, input, registration_config, valids,
+                                        target_mask, self.config.label_mode)
+        registration.update(config=asdict(self.config), valid_regions=regions)
         index = registration['ranking'][0]
         source = templates[index]
         best = registration['matches'][index]
@@ -69,8 +78,8 @@ class PeriodicTemplateMatcher:
         if H is None:
             return result
         H = np.asarray(H, np.float64)
-        target_roi = build_valid_mask(to_gray(input), target_valid, self.config) > 0
-        source_roi = build_valid_mask(to_gray(source), valids[index], self.config)
+        target_roi = target_mask > 0
+        source_roi = valids[index].copy()
         result.warped_template = cv2.warpPerspective(source, H, (input.shape[1], input.shape[0]))
         _, result.geometric_valid = warp_labels(np.zeros(source.shape[:2], np.uint8), H, input.shape, source_roi)
         result.geometric_valid &= target_roi
@@ -81,10 +90,31 @@ class PeriodicTemplateMatcher:
             valid &= target_roi
             mapped[~valid] = 0
             result.mapped_labels, result.label_valid = mapped, valid
+            if self.config.periodic_completion and self.config.label_mode == 'semantic':
+                complete_periodic(result, labels[index], source_roi,
+                                  valids[index],
+                                  target_roi, self.config)
         return result
 
+    def _prepare_regions(self, templates, input, valids, target_valid,
+                         template_valid_heights, target_valid_height):
+        """Resolve per-image policy before feature extraction or template selection."""
+        heights = template_valid_heights
+        if heights is None:
+            heights = [None]*len(templates)
+        if not isinstance(heights, (tuple, list)) or len(heights) != len(templates):
+            raise ValueError('template_valid_heights must have one entry per template')
+        policies = [ValidRegion.from_config(self.config, height) for height in heights]
+        masks = [policy.build_mask(image, mask) for policy, image, mask in zip(policies, templates, valids)]
+        target_policy = ValidRegion.from_config(self.config, target_valid_height)
+        target_mask = target_policy.build_mask(input, target_valid)
+        info = dict(templates=[policy.describe(image, mask) for policy, image, mask in zip(policies, templates, masks)],
+                    target=target_policy.describe(input, target_mask))
+        return masks, target_mask, info
+
     def evaluate(self, templates, masks, input, input_masks, *, input_valid=None,
-                 template_valids=None, annotation_valids=None, target_valid=None) -> EvaluationResult:
+                 template_valids=None, annotation_valids=None, target_valid=None,
+                 template_valid_heights=None, target_valid_height=None) -> EvaluationResult:
         """Match once and compare to GT, which never guides registration.
 
         input_masks is HxW integer IDs or binary class masks 1..K. input_valid
@@ -97,11 +127,12 @@ class PeriodicTemplateMatcher:
         truth = normalize_masks(input_masks, input.shape[:2], 'input_masks')
         self._valids([input_valid], [input], 'input_valid')
         self._valids([target_valid], [input], 'target_valid')
-        roi = build_valid_mask(to_gray(input), target_valid, self.config) > 0
+        roi = ValidRegion.from_config(self.config, target_valid_height).build_mask(input, target_valid) > 0
         if input_valid is not None:
             roi &= input_valid > 0
         matched = self.match(templates, masks, input, template_valids=template_valids,
-                             annotation_valids=annotation_valids, target_valid=target_valid)
+                             annotation_valids=annotation_valids, target_valid=target_valid,
+                             template_valid_heights=template_valid_heights, target_valid_height=target_valid_height)
         if matched.mapped_labels is None:
             metrics = dict(status='match_rejected' if not matched.accepted else 'no_template_annotations',
                            score=None, mean_iou=None, mean_dice=None, pixel_accuracy=None,

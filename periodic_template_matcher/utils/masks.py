@@ -3,21 +3,12 @@ from collections.abc import Sequence
 
 import cv2
 import numpy as np
+from .regions import ValidRegion
 
 
-def build_valid_mask(gray, mask, cfg):
+def build_valid_mask(gray, mask, cfg, valid_height=None):
     """Build a matching ROI; label knowledge is represented separately."""
-    if mask is None:
-        out = np.ones(gray.shape, np.uint8)
-    else:
-        if mask.shape != gray.shape:
-            raise ValueError('Valid-mask size must match the image')
-        out = (mask > 0).astype(np.uint8)
-    if cfg.bottom_ignore_fraction:
-        out[int(gray.shape[0] * (1 - cfg.bottom_ignore_fraction)):] = 0
-    if out.sum() < 1024:
-        raise ValueError('Too few valid image pixels')
-    return out
+    return ValidRegion.from_config(cfg, valid_height).build_mask(gray, mask)
 
 
 def normalize_masks(masks, shape, name='masks'):

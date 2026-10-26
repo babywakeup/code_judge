@@ -112,7 +112,8 @@ class MatcherApiTests(unittest.TestCase):
         with patch('periodic_template_matcher.matcher.select_templates', return_value=selection()) as selector:
             result = self.matcher.evaluate([self.image], [self.labels], self.image,
                                            self.labels, input_valid=known)
-        self.assertIsNone(selector.call_args.args[4])  # target_valid, not input_valid
+        # Registration receives the resolved image ROI, never the GT-only mask.
+        np.testing.assert_array_equal(selector.call_args.args[4], np.ones_like(known))
         self.assertEqual(result.metrics['evaluated_pixels'], 100)
         self.assertEqual(result.score, 100.)
 

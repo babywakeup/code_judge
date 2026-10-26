@@ -129,7 +129,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(mapped[50, 55], 321)
         self.assertEqual(valid[0, 0], 0)
         self.assertEqual(valid[25, 25], 255)
-        self.assertIn('&lt;template&gt;', (out / 'report.html').read_text())
+        self.assertIn('&lt;template&gt;', (out / 'report.html').read_text(encoding='utf-8'))
         config = self.config(demo_annotations=True)
         result = run_config(config, out)
         self.assertFalse(result['labels_exported'])

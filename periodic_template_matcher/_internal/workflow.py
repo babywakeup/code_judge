@@ -12,6 +12,7 @@ from ..matcher import PeriodicTemplateMatcher
 from ..utils import (build_valid_mask, overlay_labels, read_image, to_gray,
                      warp_labels, write_image)
 from .visual_report import build_report
+from .periodic_report import ARTIFACTS as COMPLETION_ARTIFACTS, export_completion
 
 
 ARTIFACTS = (
@@ -19,7 +20,7 @@ ARTIFACTS = (
     'geometric_valid.png', 'matrix_template_to_target.npy', 'mapped_labels.png',
     'label_valid.png', 'label_overlay.jpg', 'demo_source_labels.png',
     'demo_mapped_labels.png', 'demo_label_valid.png', 'demo_label_overlay.jpg',
-)
+) + COMPLETION_ARTIFACTS
 
 
 def unique_templates(specs, resolve):
@@ -30,6 +31,7 @@ def unique_templates(specs, resolve):
         signature = {key: str(resolve(item[key])) if item.get(key) else None
                      for key in ('labels', 'labelme', 'annotation_valid', 'valid_mask')}
         signature['class_map'] = item.get('class_map', {})
+        signature['valid_height'] = item.get('valid_height')
         name = item.get('name', f'template_{index + 1}')
         if digest in seen:
             previous, original_signature = seen[digest]
@@ -64,7 +66,7 @@ def run_config(config_path, output_dir):
     labels = [load_labels(s, resolve, im.shape[:2]) for s, im in zip(specs, images)]
     annotation_valids = []
     for s, im, valid in zip(specs, images, valids):
-        vm = build_valid_mask(to_gray(im), valid, cfg)
+        vm = build_valid_mask(to_gray(im), valid, cfg, s.get('valid_height'))
         if s.get('annotation_valid'):
             ann = read_image(resolve(s['annotation_valid']), cv2.IMREAD_GRAYSCALE)
             if ann.shape != vm.shape:
@@ -74,7 +76,9 @@ def run_config(config_path, output_dir):
     matched = PeriodicTemplateMatcher(cfg).match(images, labels, target,
                                                 template_valids=valids,
                                                 annotation_valids=annotation_valids,
-                                                target_valid=tv)
+                                                target_valid=tv,
+                                                template_valid_heights=[s.get('valid_height') for s in specs],
+                                                target_valid_height=spec.get('target_valid_height'))
     result = matched.registration
     result.update(template_names=[s['name'] for s in specs], target=str(resolve(spec['target'])),
                   input_template_count=len(spec['templates']), unique_template_count=len(specs),
@@ -108,9 +112,9 @@ def run_config(config_path, output_dir):
     if H is not None:
         H = np.asarray(H)
         warped = matched.warped_template
-        vm = build_valid_mask(to_gray(image), valids[idx], cfg)
+        vm = build_valid_mask(to_gray(image), valids[idx], cfg, specs[idx].get('valid_height'))
         geometric_valid = matched.geometric_valid
-        tm = build_valid_mask(to_gray(target), tv, cfg) > 0
+        tm = build_valid_mask(to_gray(target), tv, cfg, spec.get('target_valid_height')) > 0
         geometric_valid &= tm
         blend = target.copy()
         blend[geometric_valid] = cv2.addWeighted(target, .5, warped, .5, 0)[geometric_valid]
@@ -119,6 +123,14 @@ def run_config(config_path, output_dir):
         write_image(out / 'geometric_valid.png', geometric_valid.astype(np.uint8) * 255)
         np.save(out / 'matrix_template_to_target.npy', H)
         result['geometric_coverage_full_image'] = float(geometric_valid.mean())
+        if matched.completed_template is not None:
+            completed_blend = export_completion(out, matched)
+            views.update(warped=matched.completed_template, valid=matched.completed_valid,
+                         blend=completed_blend)
+            result['completed_geometric_coverage_full_image'] = float(matched.completed_valid.mean())
+            completion = result['periodic_completion']
+            if completion['remaining_unknown_pixels']:
+                result['warnings'].append(f"周期补齐未覆盖全部有效 ROI：仍有 {completion['remaining_unknown_pixels']} 个未知标签像素。")
         if labels[idx] is not None:
             result['annotation_status'] = 'blocked_by_match' if not result['accepted'] else 'exported'
             if result['accepted']:

@@ -35,10 +35,10 @@ def visualize_match(result, output_path=None):
         return image
 
     target = bgr(match.input_image)
-    valid = match.geometric_valid
+    valid = match.completed_valid if match.completed_valid is not None else match.geometric_valid
     blend = shaded(target, valid)
     if match.warped_template is not None:
-        warped = bgr(match.warped_template)
+        warped = bgr(match.completed_template if match.completed_template is not None else match.warped_template)
         blend[valid] = cv2.addWeighted(target, .5, warped, .5, 0)[valid]
     prediction = shaded(target, np.zeros(valid.shape, bool))
     if match.mapped_labels is not None:
@@ -190,7 +190,7 @@ def build_report(out, result, images, target, views):
 <label>模板透明度 <input id="alpha" type="range" min="0" max="100" value="100"></label><button id="blink">按住查看目标</button></div></section>'''
     if 'label_target' in views:
         cards += [(source_title, views['label_source'], '相同颜色代表相同类别 ID；示意形状仅用于检查坐标迁移。' if not result['labels_exported'] else '原始模板上的真实类别标注。'),
-                  (label_title, views['label_target'], '圆形、矩形、多边形均为任意绘制的流程示意，不能用于训练或生产。' if not result['labels_exported'] else '只映射已标注且有效的像素，不对未覆盖周期自动外推。')]
+                  (label_title, views['label_target'], '圆形、矩形、多边形均为任意绘制的流程示意，不能用于训练或生产。' if not result['labels_exported'] else '迁移模板有效标注；启用周期补齐时，包含经图像验证的周期预测。')]
     if not available:
         panels += [('03 NO REGISTRATION - NO LABEL TRANSFER', target)] * 4
     _overview(out, panels, result)
@@ -220,7 +220,22 @@ def build_report(out, result, images, target, views):
         link_names += ['mapped_labels.png', 'label_valid.png', 'label_overlay.jpg']
     if result['demo_labels_exported']:
         link_names += ['demo_source_labels.png', 'demo_mapped_labels.png', 'demo_label_valid.png', 'demo_label_overlay.jpg']
+    periodic_section = ''
+    if 'periodic_completion' in result:
+        completion = result['periodic_completion']
+        link_names += ['periodic_overlay.html', 'completed_alignment.jpg', 'completed_geometric_valid.png',
+                       'periodic_valid.png', 'label_periodic_valid.png', 'completion_regions.jpg']
+        periodic_section = f'''<section class="card"><h2>周期补齐</h2>
+<p>有效 ROI 标签覆盖率：{completion['label_coverage_roi']:.2%}；剩余未知像素：{completion['remaining_unknown_pixels']}；状态：{escape(completion['status'])}</p>
+<p><a href="periodic_overlay.html">打开直接配准 / 周期补齐双透明度预览</a></p></section>'''
     links = ''.join(f'<a download href="{name}">{name}</a>' for name in link_names)
+    region_section = ''
+    if 'valid_regions' in result:
+        regions = result['valid_regions']
+        region_rows = ''.join(f"<li>{escape(name)}：有效高度 {region['valid_height']} / {region['image_height']}，有效像素 {region['valid_pixels']}</li>"
+                              for name, region in [('input', regions['target'])] +
+                              list(zip(result['template_names'], regions['templates'])))
+        region_section = f'<section class="card"><h2>匹配前有效区域</h2><p>高度按原图像素计数，仅使用顶部 [0, H)；同时与图像 mask 取交集。</p><ul>{region_rows}</ul></section>'
     html = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>模板匹配与标注映射 · SD-1</title><style>
 :root{{--bg:#0a1020;--card:#121d32;--line:#293851;--text:#e7edf8;--muted:#9aaecb;--accent:#52ddc2}}
@@ -241,11 +256,11 @@ table{{width:100%;border-collapse:collapse;text-align:left}}th,td{{padding:14px;
 <section class="card warning"><h3>使用边界与标注状态</h3><ul>{warnings}</ul><p>状态：{escape(result['status'])} ｜ 标签模式：{escape(result['label_mode'])} ｜ 模板分差：{gap_text}</p></section>
 <section class="card"><h2>模板候选排行榜</h2><div class="table-wrap"><table><thead><tr><th>排序</th><th>模板 / 原始别名</th><th>匹配分</th><th>ROI 覆盖</th><th>真实标注</th><th>几何检查</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 <p>同一目标 ROI、同一工作分辨率评分。分数或模板分差不足时，不输出正式迁移标签。</p></section>
-{compare}<h2 style="margin:30px 0 18px">可视化检查面板</h2><div class="gallery">{gallery}</div>
+{region_section}{periodic_section}{compare}<h2 style="margin:30px 0 18px">可视化检查面板</h2><div class="gallery">{gallery}</div>
 <section class="card"><h2>坐标变换与诊断</h2><p>下列 3×3 矩阵由模板原始像素 [x, y, 1] 映射到目标原始像素；类别掩码始终使用最近邻采样。</p><pre>{matrix_text}</pre>
 <p>score = 100 × (0.55 × NCC + 0.30 × 边缘对齐 + 0.15 × 局部一致性) × √覆盖率</p>
 <p>边缘对齐：{best.get('edge_alignment', 0):.3f} ｜ 局部一致性：{best.get('local_consistency', 0):.3f} ｜ ECC 收敛：{best.get('ecc_converged', False)} ｜ 周期结构：{best.get('periodic_detected', False)}</p>
-<p>只有 label_valid 非零的位置才有已知类别；0 可以是真实背景，也可以是无标签填充值。未覆盖区域不作周期外推。</p></section>
+<p>只有 label_valid 非零的位置才有有效类别预测；0 可以是背景，也可以是无标签填充值。周期补齐像素由 label_periodic_valid 单独记录，验证失败的位置保持未知。</p></section>
 <section class="card"><h2>下载结果</h2><p>本页图像已内嵌，可离线浏览；下载链接需与结果文件保存在同一目录。</p><div class="downloads">{links}</div></section>
 <footer>无真实标注时仅验证配准与坐标迁移流程，不宣称真实分割精度或绝对周期身份。</footer></main>
 <script>const split=document.getElementById('split'),alpha=document.getElementById('alpha'),aligned=document.getElementById('aligned'),divider=document.getElementById('divider');

@@ -10,8 +10,9 @@ import math
 import cv2
 import numpy as np
 
+from .opencv_registration import translation_peaks as opencv_translation_peaks
 from ..config import MatcherConfig
-from ..utils import build_valid_mask, to_gray
+from ..utils import ValidRegion, build_valid_mask, to_gray
 
 
 def _features(gray, mask):
@@ -19,6 +20,7 @@ def _features(gray, mask):
     # Repair excluded overlays before filtering to avoid leaking text/borders.
     if not mask.all():
         repaired = cv2.inpaint(gray, (1 - mask) * 255, 3, cv2.INPAINT_TELEA)
+        gray = repaired
         x = repaired.astype(np.float32) / 255.0
     x = cv2.GaussianBlur(x, (0, 0), 0.8)
     mean = cv2.GaussianBlur(x, (0, 0), 9)
@@ -192,8 +194,8 @@ def register(template, target, cfg=None, template_valid=None, target_valid=None,
         raise ValueError('Extreme image aspect/size mismatch; use comparable fields of view')
     Da = np.diag([ashape[0]/a.shape[1], ashape[1]/a.shape[0], 1.0])
     Db = np.diag([bshape[0]/b.shape[1], bshape[1]/b.shape[0], 1.0])
-    aa, bb = cv2.resize(a, ashape, interpolation=cv2.INTER_AREA), cv2.resize(b, bshape, interpolation=cv2.INTER_AREA)
-    am, bm = cv2.resize(am, ashape, interpolation=cv2.INTER_NEAREST), cv2.resize(bm, bshape, interpolation=cv2.INTER_NEAREST)
+    aa, am = ValidRegion.resize_for_matching(a, am, ashape)
+    bb, bm = ValidRegion.resize_for_matching(b, bm, bshape)
     fail = dict(match_score=0.0, geometry_accepted=False, absolute_cell_verified=False,
                 periodic_detected=False, matrix_template_to_target=None, candidates=[],
                 working_scale=scale, working_target_size=list(bshape),
@@ -210,7 +212,8 @@ def register(template, target, cfg=None, template_valid=None, target_valid=None,
             A, size = _centered_warp(aa.shape, angle, zoom)
             sg = cv2.warpPerspective(src[1], A, size)
             sm = cv2.warpPerspective(src[3], A, size, flags=cv2.INTER_NEAREST)
-            for merit, dx, dy in _translation_peaks(sg, dst[1], sm, dst[3], cfg):
+            search = opencv_translation_peaks if cfg.backend == 'opencv' else _translation_peaks
+            for merit, dx, dy in search(sg, dst[1], sm, dst[3], cfg):
                 H = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]], float) @ A
                 coarse.append((merit, H))
     shortlist = []

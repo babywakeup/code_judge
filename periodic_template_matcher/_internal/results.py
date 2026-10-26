@@ -19,6 +19,10 @@ class MatchResult:
     geometric_valid: np.ndarray
     mapped_labels: np.ndarray | None = None
     label_valid: np.ndarray | None = None
+    completed_template: np.ndarray | None = None
+    completed_valid: np.ndarray | None = None
+    periodic_valid: np.ndarray | None = None
+    label_periodic_valid: np.ndarray | None = None
 
     @property
     def accepted(self):
