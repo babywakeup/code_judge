@@ -20,7 +20,7 @@ OpenCV 后端替换粗搜索；两个后端都可启用下述周期补齐，计�
 
 本代码比较两张或多张模板与同一目标图的匹配程度，给出0—100的match score、排序和变换矩阵，并将选中模板的类别掩码映射到目标图。
 
-这是可运行的传统视觉基线，采用结构归一化、线性相关多候选、仿射ECC精配准和统一质量评分。支持重复模板去重、PNG / LabelMe 分割标注、离线中文交互报告及六宫格总览。支持可选的周期标签补齐，尚未实现局部非刚性变形或设备坐标标定。现场精度需要用真实标注验证。
+这是可运行的传统视觉基线，采用结构归一化、线性相关多候选、仿射 ECC 精配准和统一质量评分。支持重复模板去重、PNG / LabelMe 分割标注、周期标签补齐和独立的预测查看 app。推理和可视化分为两个阶段：先保存原始预测数据，再打开 app 观察。尚未实现局部非刚性变形或设备坐标标定。
 
 ## 匹配前设置有效高度
 
@@ -73,7 +73,7 @@ result = matcher.match(
 
 ## 周期补齐与完整 ROI 预测
 
-在 `options` 中设置 `"periodic_completion": true`，匹配接受且有语义标注后执行补齐。
+在 `options.periodic` 中设置 `"periodic_completion": true`，匹配接受且有语义标注后执行补齐。
 SD-1 的两份 LabelMe 配置已经启用；通用 API 默认关闭，以保留原有行为。
 
 周期来源优先级：`period_vectors` 显式配置、`periodic_anchor_class`（默认 1）的重复
@@ -84,7 +84,8 @@ SD-1 的两份 LabelMe 配置已经启用；通用 API 默认关闭，以保留�
 先保留直接配准，再生成整数周期副本，只处理有机会提供未知标签的候选。每个候选进行 ECC
 校正和图像验证，校正幅度受周期约束；默认要求结构 NCC >= 0.75、边缘评分 >= 0.6。
 还会对每个待新增连通区域及其有限邻域单独验证，避免内部大面积重合掩盖边缘不匹配。
-通过后，以最近邻迁移类别和 annotation_valid，填充背景与前景，保留类别 ID 和直接预测。
+通过后，以最近邻迁移类别和 annotation_valid，填充背景与前景，保留类别 ID 和已有非零前景标签。
+若同一个周期前景连通区域横跨未知区与直接配准区，会将其在背景 0 上的部分一并补齐，避免物体被配准边界截断；完全位于直接区域内的其他物体不会因此扩张。
 `periodic_max_steps` 默认 2（范围 1..5），限定每个周期方向的复制步数，避免无界搜索。
 
 API 的 `mapped_labels` / `label_valid` 为最终预测；`geometric_valid` / `warped_template`
@@ -92,13 +93,7 @@ API 的 `mapped_labels` / `label_valid` 为最终预测；`geometric_valid` / `w
 `label_periodic_valid` 分别表示补齐图像、补齐几何范围、图像补齐区和标签补齐区。
 未执行周期补齐时这些新增字段为 None。仅在 semantic 模式补齐，不复制唯一实例编号。
 
-输出新增：
-
-- `periodic_overlay.html`：离线查看 input 与模板，直接区和周期补齐区分别调透明度。
-- `completed_alignment.jpg`：补齐后的 50% 叠加。
-- `completed_geometric_valid.png` / `periodic_valid.png`：最终图像范围 / 周期新增范围。
-- `label_periodic_valid.png`：最终 mask 中由周期补齐的像素。
-- `completion_regions.jpg`：绿色为直接配准，橙色为周期补齐。
+最终类别预测保存在 `mapped_labels.png`，其中已包含通过验证的周期补齐。`label_periodic_valid.png` 单独记录由周期补齐的标签像素；app 可切换“全部预测 / 直接配准 / 周期补全”观察。
 
 `result.json.periodic_completion` 记录来源、周期向量、每个副本的变换和评分、
 `label_coverage_roi`、`remaining_unknown_pixels` 以及 complete/incomplete/no_period 状态。
@@ -106,22 +101,25 @@ API 的 `mapped_labels` / `label_valid` 为最终预测；`geometric_valid` / `w
 无可靠周期、验证失败或源标注不完整时保持未知并报告原因。局部标注必须配置 annotation_valid，
 否则 LabelMe 未画区域按既有约定视为已知背景。底部排除区域始终不参与补齐。
 
-## 本次 SD-1 图片：直接看结果
+## 两阶段运行与查看
 
-- [交互报告](results/sd1_1792571365518/report.html)：模板排序、拖动分割线、透明度切换、按住查看目标、边缘对齐、棋盘格、差异热图、有效覆盖、标注映射示意。图片内嵌，可离线查看。
-- [六宫格总览](results/sd1_1792571365518/overview.jpg)。
-- [结构化结果](results/sd1_1792571365518/result.json)。
-- [本次配置](config.sd1.json)。
+在项目根目录运行以下两个命令，或直接运行 `bash run.sh`：
 
-上述历史报告生成时，两条模板输入完全相同并被合并。当前 [配置](config.sd1.json) 已改为两张不同模板（尾号 1258237、1343428），目标为尾号 1365518，均位于 SD-1/10-21 数据目录。重构前调试时两张模板得分分别约 73.74、19.81；历史报告不会自动更新，应重新运行生成新报告。文件内容完全一致时，配置流程仍自动合并重复模板。
+```bash
+# Stage 1：匹配、周期补齐并保存 input 和预测 mask
+python -m periodic_template_matcher --config periodic_template_matcher/config.sd1.labelme.opencv.json --out periodic_template_matcher/results/sd1_opencv
 
-实测匹配分 **73.74 / 100**，目标有效 ROI 覆盖 **83.80%**，结构 NCC **0.8496**，全局仿射配准通过。覆盖率针对排除底部 8% 设备文字后的工作 ROI，**不是全图覆盖，也不是分割准确率**。本例检测到周期结构，绝对周期编号未验证。
+# Stage 2：读取保存的数据，在独立桌面 app 中观察
+python -m periodic_template_matcher.app --result periodic_template_matcher/results/sd1_opencv
+```
 
-当前没有真实分割标注，故 **不生成正式 `mapped_labels.png` / `label_valid.png`**。配置中的 `demo_annotations: true` 仅绘制任意圆形、矩形、多边形来演示坐标映射；`demo_*` 文件和报告均明确标记“非真实标注”，不得用于训练或生产。
+app 支持原图、类别 mask、透明叠加、左右同步对照、类别筛选、周期来源筛选、滚轮缩放、拖动平移和像素类别查询。打开或重新读取结果不会再次匹配。完整说明见 [app/README.md](app/README.md)。
+
+旧的 `visualize()` 和 HTML 报告已移除。无标注或匹配被拒绝时保存原图与状态，app 明确显示没有预测；`demo_annotations` 旧字段不再生成示意 mask。
 
 ## 安装及运行
 
-建议Python 3.10或以上。OpenCV使用headless版，无GUI依赖。
+建议 Python 3.10 或以上。第一阶段使用 headless OpenCV；第二阶段桌面 app 使用 Tkinter，Windows 的标准 Python 通常自带，无需安装其他 pip 包。
 
 推荐在**工作区根目录（本包的父目录）**运行：
 
@@ -150,7 +148,8 @@ python -m examples.matcher_demo --out periodic_template_matcher/results/api_demo
 |---|---|
 | [包入口](./__init__.py) | 明确列出公开 API；不执行 CLI 或读写配置 |
 | [配置](config.py) | 唯一的 `MatcherConfig` 与参数校验 |
-| [Matcher](matcher.py) | `match` / `evaluate` / `visualize` 的流程编排 |
+| [Matcher](matcher.py) | `match` / `evaluate` / `save_result` 的流程编排 |
+| [结果查看 app](app/README.md) | 独立读取保存的 input、mask 和有效区域，交互观察 |
 | [模块启动](./__main__.py) | 唯一的命令行启动入口及参数解析 |
 | [内部实现](_internal/__init__.py) | 配准、评估、结果类型、标注、报表及 JSON 工作流；不是公开 API |
 | [图像工具](utils/images.py) | 图像 IO、灰度转换与照片校验 |
@@ -238,20 +237,18 @@ score = 100 × (0.55 × structure_ncc
 
 ## 输出文件
 
-- `report.html`：自包含中文交互报告；下载链接要求结果文件仍保存在同目录。
-- `overview.jpg`：六宫格总览，可直接在 VS Code 中打开。
-- `result.json`：各模板score、排序、第二模板分差、各候选、诊断及变换矩阵。
+- `input.png`：无损保存的原始分辨率 input，不依赖原始输入路径。
+- `result.json`：各模板分数、排名、诊断、预测状态，以及 `artifacts` 文件清单。
 - `matrix_template_to_target.npy`：3×3矩阵，明确从模板原始像素坐标映射到目标原始像素坐标。
-- `best_alignment.jpg`：最高分模板与目标的半透明叠加预览，仅供检查，`accepted=false`时也可能存在。
 - `geometric_valid.png`：图像的有效几何重叠范围。
 - `mapped_labels.png`：接受匹配且该模板有标注时输出的16位类别ID图。
 - `label_valid.png`：标注在目标图上的有效范围，未覆盖处不能解释为背景。
-- `label_overlay.jpg`：标签叠加预览。
-- `demo_source_labels.png` / `demo_mapped_labels.png` / `demo_label_valid.png` / `demo_label_overlay.jpg`：仅在所选模板无标注、存在配准矩阵且显式开启 `demo_annotations` 时生成；**包括匹配拒绝时也可作为诊断示意，绝非正式标签**。
+- `label_periodic_valid.png`：可选，标记周期补齐产生的有效标签。
+- `ground_truth.png` / `ground_truth_valid.png`：保存 `EvaluationResult` 时附带真实标签和评估区域；指标保存在 `result.json.evaluation`。
 
-`result.json` 中 `labels_exported`、`annotation_status`、`demo_labels_exported` 区分真实标签和示意。`template_aliases` 保留原始模板条目与去重候选的映射；`best_template_index` 是去重候选索引。
+`result.json.prediction_status` 为 `available`、`match_rejected` 或 `no_template_annotations`。后两种情况不生成预测文件，也会清理同目录上次的旧预测。`template_aliases` 保留去重映射；`best_template_index` 是去重候选索引。
 
-报告在匹配被拒绝时仍显示最高分候选及拒绝状态，用于排查，不能将可视化预览误当成已接受结果。差异热图只是局部归一化后的图像差异，不是缺陷分割。底部排除区保持未知；其他未覆盖区域仅在启用周期补齐且验证通过时填充。
+app 在匹配拒绝时显示原图和拒绝状态。底部排除区保持未知；其他未覆盖区域仅在启用周期补齐且验证通过时填充。紫色斜纹表示未知区域，不是背景类别 0。
 
 默认只迁移模板已有标注；启用周期补齐后，可使用验证通过的周期副本补齐裁切差异造成的未知区域。
 
@@ -259,7 +256,7 @@ score = 100 × (0.55 × structure_ncc
 
 ## 类式 Python API（推荐）
 
-`PeriodicTemplateMatcher` 是统一匹配入口；`MatcherConfig` 初始化配准、标签模式和评估参数。类接口统一负责匹配、标签迁移、评估和检查图；JSON 文件流程也调用同一个 Matcher。
+`PeriodicTemplateMatcher` 是统一匹配入口；`MatcherConfig` 初始化配准、标签模式和评估参数。类接口负责匹配、标签迁移、评估和结果保存；JSON 文件流程也调用同一个 Matcher。观察效果使用独立的第二阶段 app。
 
 ### 输入约定
 
@@ -294,19 +291,20 @@ print(result.matrix_template_to_target)
 if result.mapped_labels is not None:
     predicted = result.mapped_labels  # H×W uint16 类别图
     known = result.label_valid       # H×W bool；False 是未知，不是背景
-canvas = matcher.visualize(result, "match_check.jpg")  # BGR 数组，无需 GUI
+manifest = matcher.save_result(result, "periodic_template_matcher/results/my_match")
+print(manifest)  # result.json 的绝对路径
 
 truth = read_image("target_labels.png", cv2.IMREAD_UNCHANGED)
 evaluated = matcher.evaluate(templates, masks, target, truth)
 print(evaluated.score, evaluated.metrics)
-matcher.visualize(evaluated, "evaluation_check.jpg")
+matcher.save_result(evaluated, "periodic_template_matcher/results/my_evaluation")
 ```
 
 `match()` 返回 `MatchResult`：`registration` 保存各候选、排序、状态和阈值；`mapped_labels` / `label_valid` 仅在匹配通过且最佳模板有标注时存在。`warped_template` / `geometric_valid` 可以在拒绝时存在，但仅供诊断。构造时复制配置；不修改调用方的图像或标签，不自动写文件。
 
 `evaluate()` 每次内部调用一次 `match()`；如果已经调用过 `match()` 再调用 `evaluate()` 会重新配准。结果为 `EvaluationResult`，包含 `match`、`metrics`、`ground_truth`、`ground_truth_valid`。需要同时评分与可视化时，直接调用一次 `evaluate()`，再使用其中的 `match` 即可。
 
-可视化统一调用 `matcher.visualize(result, output_path=None)`，不再增加独立的公开可视化入口。六宫格含模板、输入、配准叠加、预测；有真值时增加真值与错误图，无真值时展示几何及标签覆盖。错误图绿色=正确、红色=错类/漏分、橙色=背景误报、品红=未覆盖真实前景，暗色=未知。图片可直接在 VS Code 中打开，函数不会启动 GUI。
+第一阶段调用 `matcher.save_result(result, output_dir)` 保存数据并返回 manifest 路径，不创建窗口。第二阶段运行 `python -m periodic_template_matcher.app --result OUTPUT_DIR` 观察 input 与预测 mask；也可只启动 app，然后点击“打开结果目录”。
 
 ### 评估指标与边界情况
 
@@ -320,7 +318,7 @@ matcher.visualize(evaluated, "evaluation_check.jpg")
 - 默认不计背景且预测/真值全为背景时，前景 mIoU/Dice/score 为 `None`，像素准确率仍可为 1；如需背景分，显式开启 `include_background=True`。
 - 周期图在 `instance` 模式下仍会被身份保护拒绝，不能绕过匹配门限计算正式预测分。周期补齐仅用于通过匹配的 semantic 模式。
 
-[可运行示例](../examples/matcher_demo.py) 自动生成有已知变换和两类标注的**合成**图，调用评估并保存检查图、预测标签、有效范围及指标 JSON；无需额外输入。它验证 API 流程，不代表产线精度。
+[可运行示例](../examples/matcher_demo.py) 自动生成有已知变换和两类标注的**合成**图，调用 `evaluate()` 与 `save_result()` 保存 input、预测标签、有效范围及指标 JSON，并打印 app 打开命令；无需额外输入。它验证 API 流程，不代表产线精度。
 
 ## 已进行的验证
 
@@ -383,4 +381,4 @@ matcher.visualize(evaluated, "evaluation_check.jpg")
 
 配准流程按职责拆分：`_prepare_image()` 生成工作分辨率特征，`_coarse_candidates()` 搜索粗匹配候选，`_refine_candidates()` 执行 ECC 精配准，`_register_prepared()` 汇总判定结果。多模板选择时，input 的预处理和周期检测只做一次，并供所有模板复用。
 
-`matcher.match()` 负责输入与 ROI 准备、调用模板选择、迁移标签以及可选的周期补全。`warp_valid_mask()` 直接投影有效区域，无需创建一张全零标签图。`workflow.run_config()` 负责配置、文件读写与报告导出。
+`matcher.match()` 负责输入与 ROI 准备、调用模板选择、迁移标签以及可选的周期补全。`warp_valid_mask()` 直接投影有效区域，无需创建一张全零标签图。`workflow.run_config()` 负责配置、文件读写并调用 `save_result()` 导出结果。

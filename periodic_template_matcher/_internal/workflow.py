@@ -1,4 +1,4 @@
-"""Configuration, duplicate handling, annotation transfer and report artifacts."""
+"""Configuration, duplicate handling and stage-1 prediction persistence."""
 
 from __future__ import annotations
 
@@ -8,24 +8,13 @@ import hashlib
 import json
 
 import cv2
-import numpy as np
 
 from ..config import MatcherConfig
 from ..matcher import PeriodicTemplateMatcher
-from ..utils import (build_valid_mask, overlay_labels, read_image,
-                     warp_labels, write_image)
+from ..utils import read_image
 from ..utils.types import Diagnostics, PathInput, Resolver
-from .annotations import demo_labels, load_labels
-from .periodic_report import ARTIFACTS as COMPLETION_ARTIFACTS, export_completion
-from .visual_report import build_report
-
-
-ARTIFACTS = (
-    'result.json', 'report.html', 'overview.jpg', 'best_alignment.jpg',
-    'geometric_valid.png', 'matrix_template_to_target.npy', 'mapped_labels.png',
-    'label_valid.png', 'label_overlay.jpg', 'demo_source_labels.png',
-    'demo_mapped_labels.png', 'demo_label_valid.png', 'demo_label_overlay.jpg',
-) + COMPLETION_ARTIFACTS
+from .annotations import load_labels
+from .result_io import ARTIFACTS
 
 
 def unique_templates(
@@ -74,98 +63,31 @@ def run_config(config_path: PathInput, output_dir: PathInput) -> Diagnostics:
     # Annotation knowledge and image ROI are intersected once inside match().
     annotation_valids = [read_image(resolve(s['annotation_valid']), cv2.IMREAD_GRAYSCALE)
                         if s.get('annotation_valid') else None for s in specs]
-    matched = PeriodicTemplateMatcher(cfg).match(images, labels, target,
-                                                template_valids=valids,
-                                                annotation_valids=annotation_valids,
-                                                target_valid=tv,
-                                                template_valid_heights=[s.get('valid_height') for s in specs],
-                                                target_valid_height=spec.get('target_valid_height'))
+    matcher = PeriodicTemplateMatcher(cfg)
+    matched = matcher.match(images, labels, target,
+                            template_valids=valids,
+                            annotation_valids=annotation_valids,
+                            target_valid=tv,
+                            template_valid_heights=[s.get('valid_height') for s in specs],
+                            target_valid_height=spec.get('target_valid_height'))
     result = matched.registration
     result.update(template_names=[s['name'] for s in specs], target=str(resolve(spec['target'])),
                   input_template_count=len(spec['templates']), unique_template_count=len(specs),
-                  template_aliases=aliases, labels_exported=False, demo_labels_exported=False,
-                  annotation_status='not_available', warnings=[])
-    if len(specs) < len(spec['templates']):
-        result['warnings'].append('重复模板已合并，不将同一张图作为两个竞争模板。')
-    if len(specs) == 1:
-        result['warnings'].append('当前仅有一个唯一模板：已验证配准，但未验证真实多模板选择。')
-    for r, s in zip(result['matches'], specs):
-        r.update(template_name=s['name'], template_image=str(resolve(s['image'])),
-                 annotation_available=labels[r['template_index']] is not None)
-    # Only remove owned artifacts, and never overwrite a configured input.
+                  template_aliases=aliases, warnings=[])
+    for match, template in zip(result['matches'], specs):
+        match.update(template_name=template['name'], template_image=str(resolve(template['image'])),
+                     annotation_available=labels[match['template_index']] is not None)
+    selected = specs[result['ranking'][0]]
+    result['class_names'] = {str(value): name for name, value in selected.get('class_map', {}).items()}
+    # The exporter replaces owned artifacts; none may be configured input files.
     inputs = {config_path, resolve(spec['target'])}
     if spec.get('target_valid_mask'):
         inputs.add(resolve(spec['target_valid_mask']))
-    for s in specs:
-        inputs.update(resolve(s[k]) for k in ('image', 'labels', 'labelme', 'valid_mask', 'annotation_valid') if s.get(k))
-    if any(out / name in inputs for name in ARTIFACTS):
+    for template in spec['templates']:
+        inputs.update(resolve(template[key]) for key in
+                      ('image', 'labels', 'labelme', 'valid_mask', 'annotation_valid')
+                      if template.get(key))
+    if any((out / name).resolve() in inputs for name in ARTIFACTS):
         raise ValueError('Output artifacts must not overwrite input files')
-    out.mkdir(parents=True, exist_ok=True)
-    for name in ARTIFACTS:
-        (out / name).unlink(missing_ok=True)
-    # Always show the top candidate for diagnosis, including rejected registrations.
-    idx = result['ranking'][0]
-    best, image = result['matches'][idx], images[idx]
-    if labels[idx] is not None:
-        result['annotation_status'] = 'blocked_by_match'
-    H = best.get('matrix_template_to_target')
-    views = {}
-    if H is not None:
-        H = np.asarray(H)
-        warped = matched.warped_template
-        vm = build_valid_mask(image, valids[idx], cfg, specs[idx].get('valid_height'))
-        geometric_valid = matched.geometric_valid
-        blend = target.copy()
-        blend[geometric_valid] = cv2.addWeighted(target, .5, warped, .5, 0)[geometric_valid]
-        views.update(warped=warped, valid=geometric_valid, blend=blend)
-        write_image(out / 'best_alignment.jpg', blend)
-        write_image(out / 'geometric_valid.png', geometric_valid.astype(np.uint8) * 255)
-        np.save(out / 'matrix_template_to_target.npy', H)
-        result['geometric_coverage_full_image'] = float(geometric_valid.mean())
-        if matched.completed_template is not None:
-            completed_blend = export_completion(out, matched)
-            views.update(warped=matched.completed_template, valid=matched.completed_valid,
-                         blend=completed_blend)
-            result['completed_geometric_coverage_full_image'] = float(matched.completed_valid.mean())
-            completion = result['periodic_completion']
-            if completion['remaining_unknown_pixels']:
-                result['warnings'].append(f"周期补齐未覆盖全部有效 ROI：仍有 {completion['remaining_unknown_pixels']} 个未知标签像素。")
-        if labels[idx] is not None:
-            result['annotation_status'] = 'blocked_by_match' if not result['accepted'] else 'exported'
-            if result['accepted']:
-                mapped, valid = matched.mapped_labels, matched.label_valid
-                write_image(out / 'mapped_labels.png', mapped)
-                write_image(out / 'label_valid.png', valid.astype(np.uint8) * 255)
-                overlay = overlay_labels(target, mapped, valid)
-                write_image(out / 'label_overlay.jpg', overlay)
-                known = vm > 0
-                if annotation_valids[idx] is not None:
-                    known &= annotation_valids[idx] > 0
-                views.update(label_source=overlay_labels(image, labels[idx], known),
-                             label_target=overlay)
-                result.update(labels_exported=True, label_coverage_full_image=float(valid.mean()),
-                              mapped_class_ids=np.unique(mapped[valid]).tolist())
-        else:
-            result['warnings'].append('所选模板没有真实分割标注；未生成正式 mapped_labels / label_valid。')
-            if spec.get('demo_annotations', False):
-                tm = build_valid_mask(target, tv, cfg, spec.get('target_valid_height')) > 0
-                source = demo_labels(image.shape[:2])
-                mapped, valid = warp_labels(source, H, target.shape, vm)
-                valid &= tm
-                mapped[~valid] = 0
-                write_image(out / 'demo_source_labels.png', source)
-                write_image(out / 'demo_mapped_labels.png', mapped)
-                write_image(out / 'demo_label_valid.png', valid.astype(np.uint8) * 255)
-                overlay = overlay_labels(target, mapped, valid)
-                write_image(out / 'demo_label_overlay.jpg', overlay)
-                views.update(label_source=overlay_labels(image, source, vm > 0), label_target=overlay)
-                result['demo_labels_exported'] = True
-                result['warnings'].append('demo_* 仅为人工几何示意，不是真实标注、预测或正式迁移结果。')
-    else:
-        result['warnings'].append('没有可用变换矩阵；仅展示原始输入与拒绝原因。')
-    if best.get('periodic_detected'):
-        result['warnings'].append('检测到周期结构，绝对周期编号未验证；不可据此迁移唯一实例编号。')
-    result['report'] = 'report.html'
-    build_report(out, result, images, target, views)
-    (out / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-    return result
+    manifest = matcher.save_result(matched, out)
+    return json.loads(manifest.read_text(encoding='utf-8'))

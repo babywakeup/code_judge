@@ -14,7 +14,7 @@ class MatchResult:
     """Registration metadata plus target-sized arrays, with no file IO.
 
     mapped_labels/label_valid exist only for an accepted, annotated match.
-    The top-ranked template can still be visualized when rejected.
+    Saving a rejected result retains its input and status without a prediction.
     """
 
     registration: Diagnostics

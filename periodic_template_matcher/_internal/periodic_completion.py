@@ -1,4 +1,4 @@
-"""Verified lattice copies fill unknown target labels without overwriting direct data."""
+"""Verified periodic copies fill unknown labels and complete boundary foreground."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import numpy as np
 
 from ..config import MatcherConfig
 from ..utils import ValidRegion, to_gray, warp_labels, warp_valid_mask
-from ..utils.types import Array, LabelMap, Mask
+from ..utils.types import Array, BoolMask, LabelMap, Mask
 from .registration import _features, _refine, _score
 from .results import MatchResult
 
@@ -42,6 +42,26 @@ def anchor_vectors(labels: LabelMap, valid: Mask, class_id: int) -> list[Array]:
         if len(cluster) >= 2:  # Require repetition, not a single accidental pair.
             vectors.append(np.median(cluster, axis=0))
     return vectors
+
+
+def _candidate_fill(mapped: LabelMap, annotation: BoolMask, target: Mask,
+                    labels: LabelMap, known: BoolMask) -> BoolMask:
+    """Include whole foreground objects crossing from unknown into background.
+
+    Only components with foreground pixels in an unknown target region can seed
+    an extension. Existing nonzero labels remain protected, and unrelated objects
+    entirely inside the direct region cannot expand just because they repeat.
+    """
+    eligible = annotation & (target > 0)
+    unknown = eligible & ~known
+    fill = unknown.copy()
+    seeds = unknown & (mapped > 0)
+    for class_id in np.unique(mapped[seeds]):
+        _, components = cv2.connectedComponents(((mapped == class_id) & eligible).astype(np.uint8))
+        seeded = np.unique(components[seeds & (mapped == class_id)])
+        component = np.isin(components, seeded[seeded != 0])
+        fill |= component & known & (labels == 0)
+    return fill
 
 
 def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: Mask,
@@ -86,6 +106,9 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
                     label_coverage_roi=float(result.label_valid.sum()/total),
                     geometric_coverage_roi=float(result.completed_valid.sum()/total),
                     added_label_pixels=int(result.label_periodic_valid.sum()),
+                    newly_covered_pixels=int(result.label_valid.sum()) - info['direct_label_pixels'],
+                    boundary_foreground_pixels=(int(result.label_periodic_valid.sum())
+                                                - int(result.label_valid.sum()) + info['direct_label_pixels']),
                     remaining_unknown_pixels=missing)
 
     if result.label_valid[target_valid].all():
@@ -131,7 +154,7 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         if not accepted:
             continue
         mapped, ann = warp_labels(labels, candidate, target.shape, annotation_valid)
-        fill_labels = ann & target_valid & ~result.label_valid
+        fill_labels = _candidate_fill(mapped, ann, target_valid, result.mapped_labels, result.label_valid)
         # Validate each new connected region, not only the large aligned interior.
         # A bounded context supplies edges for thin strips and corner fragments.
         count, components = cv2.connectedComponents(fill_labels.astype(np.uint8))
@@ -153,6 +176,8 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         record['accepted'] = bool(fill_labels.any())
         if not fill_labels.any():
             continue
+        record['newly_covered_pixels'] = int((fill_labels & ~result.label_valid).sum())
+        record['boundary_foreground_pixels'] = int((fill_labels & result.label_valid).sum())
         result.mapped_labels[fill_labels] = mapped[fill_labels]
         result.label_valid |= fill_labels
         result.label_periodic_valid |= fill_labels

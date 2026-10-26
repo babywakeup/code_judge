@@ -12,7 +12,7 @@ from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher
 from periodic_template_matcher._internal.evaluation import evaluate_segmentation
 from periodic_template_matcher.utils import read_image, warp_labels
 from periodic_template_matcher.utils.masks import normalize_masks
-from periodic_template_matcher._internal.visual_report import visualize_match
+from periodic_template_matcher.app.data import load_result
 from tests.helpers import texture
 
 
@@ -48,7 +48,7 @@ class MatcherApiTests(unittest.TestCase):
         self.assertFalse(result.label_valid[0, 0])
         json.dumps(evaluation.metrics, allow_nan=False)
 
-    def test_binary_mask_lists_and_visualization(self):
+    def test_binary_mask_lists_and_saved_evaluation(self):
         first = self.labels > 0
         second = np.zeros_like(first)
         second[100:120, 130:150] = True
@@ -58,19 +58,22 @@ class MatcherApiTests(unittest.TestCase):
         self.assertEqual(evaluated.score, 100.)
         self.assertEqual(set(np.unique(evaluated.match.mapped_labels)), {0, 1, 2})
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'evaluation.png'
-            canvas = self.matcher.visualize(evaluated, path)
-            self.assertEqual(canvas.dtype, np.uint8)
-            self.assertEqual(canvas.shape[2], 3)
-            np.testing.assert_array_equal(read_image(path), canvas)
-        self.assertEqual(visualize_match(evaluated.match).shape, canvas.shape)
+            path = self.matcher.save_result(evaluated, tmp)
+            saved = load_result(path)
+            np.testing.assert_array_equal(saved.labels, evaluated.match.mapped_labels)
+            self.assertEqual(saved.metadata['evaluation']['score'], 100.)
+            np.testing.assert_array_equal(read_image(Path(tmp) / 'ground_truth.png', -1),
+                                          evaluated.ground_truth)
 
-    def test_grayscale_and_bgra_visualizations(self):
+    def test_grayscale_and_bgra_saved_results(self):
         for image in (cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY),
                       cv2.cvtColor(self.image, cv2.COLOR_BGR2BGRA)):
             with patch('periodic_template_matcher.matcher.select_templates', return_value=selection()):
                 result = self.matcher.match([image], [self.labels], image)
-            self.assertEqual(self.matcher.visualize(result).shape[2], 3)
+            with tempfile.TemporaryDirectory() as tmp:
+                manifest = self.matcher.save_result(result, tmp)
+                self.assertEqual(load_result(manifest).image.shape[2], 3)
+                np.testing.assert_array_equal(read_image(Path(tmp) / 'input.png', -1), image)
 
     def test_validity_is_separate_from_background_and_does_not_mutate_inputs(self):
         known = np.zeros_like(self.labels)
@@ -95,7 +98,9 @@ class MatcherApiTests(unittest.TestCase):
             self.assertIsNone(evaluation.match.mapped_labels)
             self.assertIsNone(evaluation.match.label_valid)
             self.assertIsNotNone(evaluation.match.warped_template)
-            self.matcher.visualize(evaluation)
+            with tempfile.TemporaryDirectory() as tmp:
+                saved = load_result(self.matcher.save_result(evaluation, tmp))
+                self.assertIsNone(saved.labels)
 
     def test_blank_match_has_no_matrix_or_prediction(self):
         blank = np.zeros_like(self.image)
@@ -104,7 +109,9 @@ class MatcherApiTests(unittest.TestCase):
         self.assertIsNone(result.matrix_template_to_target)
         self.assertIsNone(result.warped_template)
         self.assertFalse(result.geometric_valid.any())
-        self.matcher.visualize(result)
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = load_result(self.matcher.save_result(result, tmp))
+            self.assertIsNone(saved.labels)
 
     def test_ground_truth_validity_not_passed_to_registration(self):
         known = np.zeros_like(self.labels)

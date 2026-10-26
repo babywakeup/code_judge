@@ -54,15 +54,3 @@ def load_labels(spec: Diagnostics, resolve: Resolver, shape: Shape) -> LabelMap 
         else:
             raise ValueError(f'Unsupported/invalid segmentation shape: {kind}')
     return labels
-
-
-def demo_labels(shape: Shape) -> LabelMap:
-    """Artificial shapes for transport illustration, NOT product segmentation."""
-    h, w = shape
-    labels = np.zeros(shape, np.uint16)
-    cv2.circle(labels, (round(w * .33), round(h * .32)), round(min(h, w) * .05), 1, -1)
-    cv2.rectangle(labels, (round(w * .46), round(h * .40)),
-                  (round(w * .59), round(h * .45)), 2, -1)
-    points = np.array([[.62, .61], [.70, .59], [.74, .68], [.65, .71]])
-    cv2.fillPoly(labels, [np.rint(points * [w, h]).astype(np.int32)], 3)
-    return labels

@@ -21,7 +21,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     for match in result['matches']:
         print(f"{match['template_name']}: score={match['match_score']:.2f}, "
               f"geometry={match['geometry_accepted']}, periodic={match['periodic_detected']}")
-    print(f"Report: {Path(args.out).resolve() / 'report.html'}")
+    print(f"Saved result: {Path(args.out).resolve() / 'result.json'}")
+    print(f'Viewer: python -m periodic_template_matcher.app --result "{Path(args.out).resolve()}"')
 
 
 if __name__ == '__main__':

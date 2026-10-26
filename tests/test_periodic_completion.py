@@ -36,6 +36,34 @@ def fixture():
 
 
 class PeriodicCompletionTests(unittest.TestCase):
+    def test_boundary_foreground_is_not_cut_off_by_direct_background(self):
+        source, _, target, _, H = fixture()
+        labels = np.zeros((240, 240), np.uint16)
+        labels[20:42, 70:90] = 2
+        labels[20:42, 150:170] = 2
+        # The last periodic object was not annotated at the source image edge.
+        # Its target copy spans known background x=218..227 and unknown x=228..237.
+        with patch('periodic_template_matcher.matcher.select_templates', return_value=selection(True, H)):
+            result = PeriodicTemplateMatcher(self.cfg()).match([source], [labels], target)
+        np.testing.assert_array_equal(result.mapped_labels[11:33, 218:238], 2)
+        self.assertTrue(result.label_periodic_valid[11:33, 218:238].all())
+        self.assertTrue(result.geometric_valid[11:33, 218:228].all())
+        self.assertGreater(result.registration['periodic_completion']['boundary_foreground_pixels'], 0)
+        # Interior missing annotations do not seed unrelated foreground expansion.
+        self.assertFalse((result.mapped_labels[91:113, 138:158] == 2).any())
+
+    def test_boundary_completion_preserves_existing_foreground_classes(self):
+        source, _, target, _, H = fixture()
+        labels = np.zeros((240, 240), np.uint16)
+        labels[20:42, 70:90] = 2
+        labels[20:42, 150:170] = 2
+        labels[22:26, 232:234] = 1001
+        with patch('periodic_template_matcher.matcher.select_templates', return_value=selection(True, H)):
+            result = PeriodicTemplateMatcher(self.cfg()).match([source], [labels], target)
+        np.testing.assert_array_equal(result.mapped_labels[13:17, 220:222], 1001)
+        self.assertFalse(result.label_periodic_valid[13:17, 220:222].any())
+        np.testing.assert_array_equal(result.mapped_labels[11:13, 218:238], 2)
+
     def cfg(self, **kwargs):
         options = dict(max_side=240, angles=(0.,), scales=(1.,), ecc_iterations=25,
                        periodic_completion=True, period_vectors=((80., 0.), (0., 80.)))
@@ -140,7 +168,8 @@ class PeriodicCompletionTests(unittest.TestCase):
                     self.assertTrue(result['accepted'])
                     self.assertEqual(result['periodic_completion']['status'], 'complete')
                     np.testing.assert_array_equal(read_image(root/backend/'label_valid.png', 0), 255)
-                    self.assertTrue((root/backend/'periodic_overlay.html').exists())
+                    self.assertTrue((root/backend/'result.json').exists())
+                    self.assertTrue((root/backend/'input.png').exists())
                     self.assertTrue((root/backend/'label_periodic_valid.png').exists())
                     spec['options']['periodic_completion'] = False
                     path.write_text(json.dumps(spec), encoding='utf-8')

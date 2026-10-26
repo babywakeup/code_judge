@@ -1,5 +1,5 @@
 {
-  "target": "../source/SD-1/10-21/Tlink-Image-1792571352308_defect.jpeg",
+  "target": "../source/SD-1/10-21/Tlink-Image-1792571383316_defect.jpg",
   "target_valid_height": 1891,
   "templates": [
     {
@@ -8,7 +8,8 @@
       "image": "../source/SD-1/10-21/Tlink-Image-1792571258237.jpeg",
       "labelme": "../source/SD-1/10-21/Tlink-Image-1792571258237.json",
       "class_map": {
-        "1": 1
+        "1": 1,
+        "2": 2
       }
     },
     {
@@ -17,7 +18,8 @@
       "image": "../source/SD-1/10-21/Tlink-Image-1792571371308.jpeg",
       "labelme": "../source/SD-1/10-21/Tlink-Image-1792571371308.json",
       "class_map": {
-        "1": 1
+        "1": 1,
+        "2": 2
       }
     }
   ],
@@ -49,7 +51,7 @@
       "ecc_iterations": 70
     },
     "periodic": {
-      "description": "周期补全：利用重复周期结构和相似度验证补全未覆盖区域，保留已有直接映射标签。",
+      "description": "周期补全：验证并补齐未覆盖区域及跨边界的完整前景结构，保留已有非零类别标签。",
       "periodic_completion": true
     }
   }

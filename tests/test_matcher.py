@@ -121,6 +121,17 @@ class RegistrationTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_output_protection_includes_deduplicated_template_paths(self):
+        out = self.root / 'out'
+        out.mkdir()
+        duplicate = out / 'input.png'
+        duplicate.write_bytes((self.root / 'template.png').read_bytes())
+        before = duplicate.read_bytes()
+        path = self.config(templates=[{'image': 'template.png'}, {'image': 'out/input.png'}])
+        with self.assertRaisesRegex(ValueError, 'overwrite input'):
+            run_config(path, out)
+        self.assertEqual(duplicate.read_bytes(), before)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -168,7 +179,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unsupported'):
             load_labels(spec, lambda p: self.root / p, (160, 200))
 
-    def test_real_transfer_then_demo_cleans_stale_outputs(self):
+    def test_saved_prediction_then_unannotated_rerun_cleans_stale_outputs(self):
         labels = np.zeros((160, 200), np.uint16)
         labels[35:65, 40:70] = 321
         write_image(self.root / 'labels.png', labels)
@@ -185,20 +196,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(mapped[50, 55], 321)
         self.assertEqual(valid[0, 0], 0)
         self.assertEqual(valid[25, 25], 255)
-        self.assertIn('&lt;template&gt;', (out / 'report.html').read_text(encoding='utf-8'))
+        self.assertEqual(result['matches'][0]['template_name'], '<template>')
+        self.assertTrue((out / 'input.png').exists())
         config = self.config(demo_annotations=True)
         result = run_config(config, out)
         self.assertFalse(result['labels_exported'])
-        self.assertTrue(result['demo_labels_exported'])
+        self.assertFalse(result['demo_labels_exported'])
+        self.assertEqual(result['prediction_status'], 'no_template_annotations')
         self.assertFalse((out / 'mapped_labels.png').exists())
         self.assertFalse((out / 'label_valid.png').exists())
-        self.assertTrue((out / 'demo_mapped_labels.png').exists())
+        self.assertFalse((out / 'demo_mapped_labels.png').exists())
         # Rejected reruns must not leave even illustrative maps behind.
         write_image(self.root / 'target.png', np.zeros((160, 200, 3), np.uint8))
         result = run_config(config, out)
         self.assertFalse(result['accepted'])
         self.assertFalse((out / 'demo_mapped_labels.png').exists())
-        self.assertTrue((out / 'report.html').exists())
+        self.assertTrue((out / 'result.json').exists())
 
     def test_instance_mode_blocks_periodic_label_export(self):
         labels = np.ones((160, 200), np.uint8)

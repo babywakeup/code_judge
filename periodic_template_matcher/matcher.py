@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import asdict, replace
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -13,7 +14,7 @@ from ._internal.evaluation import evaluate_segmentation
 from ._internal.periodic_completion import complete_periodic
 from ._internal.registration import select_templates
 from ._internal.results import EvaluationResult, MatchResult
-from ._internal.visual_report import visualize_match
+from ._internal.result_io import save_result
 from .config import MatcherConfig
 from .utils import ValidRegion, normalize_masks, validate_image, warp_labels, warp_valid_mask
 from .utils.types import Diagnostics, Image, LabelInput, Mask, PathInput
@@ -158,7 +159,7 @@ class PeriodicTemplateMatcher:
                                             roi, include_background=self.config.include_background)
         return EvaluationResult(matched, metrics, truth, roi)
 
-    def visualize(self, result: MatchResult | EvaluationResult,
-                  output_path: PathInput | None = None) -> Image:
-        """Return a BGR inspection canvas and optionally save it, without a GUI."""
-        return visualize_match(result, output_path)
+    def save_result(self, result: MatchResult | EvaluationResult,
+                    output_dir: PathInput) -> Path:
+        """Stage 1: save arrays and metadata; open them with the stage-2 app."""
+        return save_result(result, output_dir)
