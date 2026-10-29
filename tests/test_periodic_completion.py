@@ -93,6 +93,29 @@ class PeriodicCompletionTests(unittest.TestCase):
         np.testing.assert_array_equal(result.mapped_labels, truth)
         self.assertEqual(result.registration['periodic_completion']['period_source'], 'anchor_class')
 
+    def test_dense_anchor_substructures_fall_back_to_image_period_for_left_gap(self):
+        source, _, _, _, _ = fixture()
+        tile_labels = np.zeros((80, 80), np.uint16)
+        tile_labels[20:42, 10:20] = 1
+        tile_labels[20:42, 50:60] = 1
+        labels = np.tile(tile_labels, (3, 3))
+        target = np.roll(source, (-9, 12), axis=(0, 1))
+        truth = np.roll(labels, (-9, 12), axis=(0, 1))
+        H = np.array([[1., 0, 12], [0, 1., -9], [0, 0, 1]])
+        selected = selection(True, H)
+        for fallback in ([dict(vector_work_px=[80, 0], autocorrelation=.99)],
+                         [dict(vector_work_px=[80, 0], autocorrelation=.99),
+                          dict(vector_work_px=[0, 80], autocorrelation=.99)]):
+            with self.subTest(fallback=fallback):
+                selected['matches'][0].update(working_target_size=[240, 240], lattice_candidates=fallback)
+                with patch('periodic_template_matcher.matcher.select_templates', return_value=selected):
+                    result = PeriodicTemplateMatcher(self.cfg(period_vectors=(), periodic_max_steps=1)).match([source], [labels], target)
+                self.assertTrue(result.label_valid.all())
+                np.testing.assert_array_equal(result.mapped_labels, truth)
+                info = result.registration['periodic_completion']
+                self.assertEqual(info['period_source'], 'image_autocorrelation')
+                self.assertTrue(any(not v['accepted'] for v in info['anchor_period_validation']))
+
     def test_partial_annotations_not_promoted_to_background(self):
         ann = np.zeros((240, 240), np.uint8)
         ann[20:42, 15:35] = 1

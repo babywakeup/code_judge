@@ -15,6 +15,7 @@ from .results import EvaluationResult, MatchResult
 ARTIFACTS = (
     'result.json', 'input.png', 'mapped_labels.png', 'label_valid.png',
     'label_periodic_valid.png', 'geometric_valid.png', 'matrix_template_to_target.npy',
+    'object_identities.png', 'object_valid.png',
     'ground_truth.png', 'ground_truth_valid.png',
     'report.html', 'overview.jpg', 'best_alignment.jpg', 'label_overlay.jpg',
     'demo_source_labels.png', 'demo_mapped_labels.png', 'demo_label_valid.png',
@@ -40,6 +41,10 @@ def save_result(result: MatchResult | EvaluationResult, output_dir: PathInput) -
     if match.geometric_valid.shape != shape:
         raise ValueError('geometric_valid shape must match input image')
     if has_prediction:
+        if match.object_identities is not None:
+            if (match.object_identities.shape != shape or match.object_identities.dtype != np.uint16
+                    or match.object_valid is None or match.object_valid.shape != shape):
+                raise ValueError('Object identity and validity arrays must match original input')
         if match.mapped_labels.shape != shape or match.label_valid.shape != shape:
             raise ValueError('prediction and validity shapes must match input image')
         if match.mapped_labels.dtype != np.uint16:
@@ -69,6 +74,8 @@ def save_result(result: MatchResult | EvaluationResult, output_dir: PathInput) -
                         label_coverage_full_image=float(known.mean()))
         if match.label_periodic_valid is not None:
             artifacts['periodic_valid'] = 'label_periodic_valid.png'
+        if match.object_identities is not None:
+            artifacts.update(object_identities='object_identities.png', object_valid='object_valid.png')
     if evaluation is not None:
         metadata['evaluation'] = evaluation.metrics
         artifacts.update(ground_truth='ground_truth.png', ground_truth_valid='ground_truth_valid.png')
@@ -84,6 +91,9 @@ def save_result(result: MatchResult | EvaluationResult, output_dir: PathInput) -
     if 'transform' in artifacts:
         np.save(out / artifacts['transform'], match.matrix_template_to_target)
     if has_prediction:
+        if match.object_identities is not None:
+            write_image(out / artifacts['object_identities'], match.object_identities)
+            write_image(out / artifacts['object_valid'], match.object_valid.astype(np.uint8)*255)
         write_image(out / artifacts['prediction_mask'], match.mapped_labels)
         write_image(out / artifacts['prediction_valid'], known.astype(np.uint8) * 255)
         if 'periodic_valid' in artifacts:

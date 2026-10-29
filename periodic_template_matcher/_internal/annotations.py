@@ -11,6 +11,52 @@ from ..utils import read_image
 from ..utils.types import Diagnostics, LabelMap, Resolver, Shape
 
 
+def _draw_shape(labels, item, class_id):
+    pts = np.asarray(item['points'], np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2 or not np.isfinite(pts).all():
+        raise ValueError('LabelMe points must be finite [x, y] pairs')
+    kind = item.get('shape_type', 'polygon')
+    if kind == 'polygon' and len(pts) >= 3:
+        cv2.fillPoly(labels, [np.rint(pts).astype(np.int32)], class_id)
+    elif kind == 'rectangle' and len(pts) == 2:
+        lo, hi = np.rint(pts.min(axis=0)).astype(int), np.rint(pts.max(axis=0)).astype(int)
+        cv2.rectangle(labels, tuple(lo), tuple(hi), class_id, -1)
+    elif kind == 'circle' and len(pts) == 2:
+        cv2.circle(labels, tuple(np.rint(pts[0]).astype(int)),
+                   round(float(np.linalg.norm(pts[1]-pts[0]))), class_id, -1)
+    else:
+        raise ValueError(f'Unsupported/invalid segmentation shape: {kind}')
+
+
+def load_objects(spec, resolve, shape, class_id, cycle):
+    """Preserve each original polygon, ordered by x rather than JSON draw order."""
+    order = spec.get('object_order')
+    if order is None:
+        return []
+    if (not isinstance(order, (list, tuple)) or len(order) != len(cycle)
+            or any(not isinstance(name, str) for name in order) or set(order) != set(cycle)):
+        raise ValueError('object_order must contain each configured identity exactly once')
+    if not spec.get('labelme'):
+        raise ValueError('object_order requires original LabelMe shapes')
+    data = json.loads(resolve(spec['labelme']).read_text(encoding='utf-8-sig'))
+    if (data.get('imageHeight'), data.get('imageWidth')) != tuple(shape[:2]):
+        raise ValueError('LabelMe image dimensions must match original object image')
+    objects = []
+    for index, item in enumerate(data.get('shapes', [])):
+        if spec.get('class_map', {}).get(item['label']) != class_id:
+            continue
+        mask = np.zeros(shape[:2], np.uint8)
+        _draw_shape(mask, item, 1)
+        yy, xx = np.where(mask > 0)
+        if not len(xx):
+            raise ValueError('Object reference shape is outside its source image')
+        objects.append(dict(shape_index=index, mask=mask, center_x=float((xx.min()+xx.max())/2)))
+    if len(objects) != len(order):
+        raise ValueError('object_order length must equal number of ordered-class LabelMe shapes')
+    objects.sort(key=lambda item: item['center_x'])
+    return [dict(obj, identity=name) for obj, name in zip(objects, order)]
+
+
 def load_labels(spec: Diagnostics, resolve: Resolver, shape: Shape) -> LabelMap | None:
     """None means absent, never a generated annotation. Last shape wins overlaps.
 
@@ -39,18 +85,5 @@ def load_labels(spec: Diagnostics, resolve: Resolver, shape: Shape) -> LabelMap 
         name = item['label']
         if name not in classes:
             raise ValueError(f'Unmapped LabelMe class: {name}')
-        pts = np.asarray(item['points'], np.float64)
-        if pts.ndim != 2 or pts.shape[1] != 2 or not np.isfinite(pts).all():
-            raise ValueError('LabelMe points must be finite [x, y] pairs')
-        kind = item.get('shape_type', 'polygon')
-        if kind == 'polygon' and len(pts) >= 3:
-            cv2.fillPoly(labels, [np.rint(pts).astype(np.int32)], classes[name])
-        elif kind == 'rectangle' and len(pts) == 2:
-            lo, hi = np.rint(pts.min(axis=0)).astype(int), np.rint(pts.max(axis=0)).astype(int)
-            cv2.rectangle(labels, tuple(lo), tuple(hi), classes[name], -1)
-        elif kind == 'circle' and len(pts) == 2:
-            cv2.circle(labels, tuple(np.rint(pts[0]).astype(int)),
-                       round(float(np.linalg.norm(pts[1] - pts[0]))), classes[name], -1)
-        else:
-            raise ValueError(f'Unsupported/invalid segmentation shape: {kind}')
+        _draw_shape(labels, item, classes[name])
     return labels

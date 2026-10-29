@@ -79,7 +79,10 @@ SD-1 的两份 LabelMe 配置已经启用；通用 API 默认关闭，以保留�
 周期来源优先级：`period_vectors` 显式配置、`periodic_anchor_class`（默认 1）的重复
 连通区域、input 图像自相关。标注锚点自动估计适用于接近水平/垂直的重复排列；倾斜晶格可显式
 提供一至两个模板原图坐标向量，如 `"period_vectors": [[875, 1], [-2, 874]]`。
-显式向量需要独立且非零。算法不读取目标 LabelMe 真值来指导预测。
+显式向量需要独立且非零。类别锚点的间距必须先通过模板图像的自平移验证；
+若同一类别包含多种周期内结构、最近间距不是真正图像周期，则回退到 input 图像自相关。
+`periodic_completion.anchor_period_validation` 记录验证结果，`period_fallback_reason`
+记录回退原因。算法不读取目标 LabelMe 真值来指导预测。
 
 先保留直接配准，再生成整数周期副本，只处理有机会提供未知标签的候选。每个候选进行 ECC
 校正和图像验证，校正幅度受周期约束；默认要求结构 NCC >= 0.75、边缘评分 >= 0.6。
@@ -100,6 +103,60 @@ API 的 `mapped_labels` / `label_valid` 为最终预测；`geometric_valid` / `w
 100% 覆盖表示 ROI 内每个像素都有类别预测（包括背景），不表示前景覆盖整图或 100% 准确率。
 无可靠周期、验证失败或源标注不完整时保持未知并报告原因。局部标注必须配置 annotation_valid，
 否则 LabelMe 未画区域按既有约定视为已知背景。底部排除区域始终不参与补齐。
+
+## 类别 2：独立匹配 A/B/C
+
+类别 2 的三个区域是不同物体，独立按外观匹配，检查 ABC／BCA／CAB 循环排列，支持边缘残缺。
+使用时显式配置各模板原始标注的身份顺序，例如 MA 为 ABC、UA 为 CAB：
+
+```json
+{
+  "templates": [
+    {"image": "MA.jpg", "labelme": "MA.json", "class_map": {"1": 1, "2": 2}, "object_order": ["A", "B", "C"]},
+    {"image": "UA.jpg", "labelme": "UA.json", "class_map": {"1": 1, "2": 2}, "object_order": ["C", "A", "B"]}
+  ],
+  "options": {
+    "objects": {
+      "ordered_object_class": 2,
+      "object_cycle": ["A", "B", "C"],
+      "object_min_score": 0.7,
+      "object_min_gap": 0.02,
+      "object_min_visible": 0.15
+    }
+  }
+}
+```
+
+`object_order` 按原始 LabelMe 中类别 2 形状的水平位置排序后赋予身份，保留每个原始 polygon，
+不按 JSON 绘制顺序赋值，也不从合并类别图恢复身份。每张模板必须恰好包含三个对应类别的参考形状，
+且 `object_order` 中每个身份与 `object_cycle` 一一对应。
+此功能只支持 semantic 模式；关闭方法为省略 `ordered_object_class`。
+
+模块 `_internal/ordered_objects.py` 对每个物体的原图外观构造候选，使用实际可见交集上的零均值
+归一化相关性，分别计算交集均值和能量。只在可见面积达到要求后比较三种循环排列的联合评分。
+循环排列接近时保持未知，完全不可见或证据不足的身份不由顺序强行生成。
+周期定位仅提供几何初值，物体 mask 不按单周期横移复制。评分对短纵向片段作惩罚，避免小片段
+偶然高相关压过完整物体。边缘物体可裁切匹配，但身份仍需外观和相邻物体共同支持。
+源参考本身横向被截断时，不将未观察到的物体部分标成背景；完整的同身份参考可提供补充。
+
+通用 API 的 `object_min_gap` 默认 0.03；当前 SD-1 场景设置为 0.02。这是联合相似度分差，
+不是概率或准确率，需要更多真实样本校准。若无法区分身份或可见证据不足，类别 2 保持未知。
+即使类别 1 已有周期预测，也不会把其副本中的 0 当成“这里没有类别 2”的证据。
+
+输出语义类别仍为 2，另存：
+
+- `object_identities.png`：uint16 身份图，1/2/3 对应 `object_cycle` 中的身份；这些数字不是语义类别 ID。
+- `object_valid.png`：物体分支的有效范围。
+- `result.json.ordered_objects`：状态、候选/最终排列、分差、逐物体来源、可见比例和原图变换矩阵。
+
+`ambiguous_identity` 表示候选不足以区分，不输出身份；`partial_reference` 表示使用了不完整源参考，
+未看到的范围保持未知。`accepted` 仅表示通过当前匹配条件。模板分差不足时，仅当几何匹配已通过且
+物体身份有充分证据，才以 `accepted_ordered_objects` 解决语义模板歧义；不会绕过几何门限。
+
+数组 API 的 match/evaluate 新增 `template_objects`，每张模板对应三个
+`{"identity": "A", "mask": original_size_binary_mask}` 参考，身份必须与 `object_cycle` 一致。
+无需传入 input 的标注。MatchResult 提供 `object_identities`、`object_valid` 数组。
+独立查看 app 可选择“独立物体”来源和 A/B/C 身份，鼠标悬停可查看具体身份。
 
 ## 两阶段运行与查看
 

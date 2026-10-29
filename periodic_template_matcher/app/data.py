@@ -34,6 +34,7 @@ class SavedPrediction:
     labels: LabelMap | None
     valid: BoolMask | None
     periodic: BoolMask | None
+    object_identities: LabelMap | None = None
 
     @property
     def class_ids(self) -> list[int]:
@@ -92,7 +93,14 @@ def load_result(path: PathInput) -> SavedPrediction:
             if raw_periodic.shape != shape or raw_periodic.dtype != np.uint8:
                 raise ValueError('Periodic validity dimensions/type must match input image.')
             periodic = (raw_periodic > 0) & valid
-    return SavedPrediction(manifest, metadata, image, labels, valid, periodic)
+    object_identities = None
+    if 'object_identities' in artifacts:
+        if labels is None:
+            raise ValueError('Object identity artifacts require an accepted prediction')
+        object_identities = read_image(artifact('object_identities'), cv2.IMREAD_UNCHANGED)
+        if object_identities.shape != shape or object_identities.dtype != np.uint16:
+            raise ValueError('Object identity dimensions/type must match input')
+    return SavedPrediction(manifest, metadata, image, labels, valid, periodic, object_identities)
 
 
 def class_color(class_id: int) -> tuple[int, int, int]:
@@ -110,14 +118,14 @@ def source_pixel(x: int, y: int, scale: float,
 def render_view(data: SavedPrediction, size: Size, scale: float,
                 origin: tuple[float, float], *, mode: str = 'overlay', alpha: float = .5,
                 class_id: int | None = None, source: str = 'all',
-                show_unknown: bool = True) -> Image:
+                show_unknown: bool = True, object_identity: int | None = None) -> Image:
     """Render the visible viewport, keeping labels/validity nearest-neighbor.
 
     origin is the input image's top-left position in viewport pixels. Side-by-side
     panels use the same transform. Rendering cost follows viewport size, so zoom
     never allocates a full enlarged image.
     """
-    if mode not in ('input', 'mask', 'overlay', 'split') or source not in ('all', 'direct', 'periodic'):
+    if mode not in ('input', 'mask', 'overlay', 'split') or source not in ('all', 'direct', 'periodic', 'objects'):
         raise ValueError('Invalid display mode or prediction source')
     if not np.isfinite(scale) or scale <= 0 or min(size) < 1 or not 0 <= alpha <= 1:
         raise ValueError('Invalid viewport scale, size or opacity')
@@ -137,11 +145,15 @@ def render_view(data: SavedPrediction, size: Size, scale: float,
         labels = data.labels[index]
         valid = data.valid[index] & inside
         selected = valid & ((labels > 0) if class_id is None else (labels == class_id))
+        object_ids = np.zeros_like(labels) if data.object_identities is None else data.object_identities[index]
+        if object_identity is not None:
+            selected &= object_ids == object_identity
         if source != 'all':
             periodic = np.zeros_like(valid)
             if data.periodic is not None:
                 periodic = data.periodic[index] & inside
-            selected &= periodic if source == 'periodic' else ~periodic
+            selected &= (periodic if source == 'periodic' else (object_ids > 0) if source == 'objects'
+                         else (~periodic & (object_ids == 0)))
         colors = CLASS_COLORS[labels]
         if mode == 'mask':
             output[:] = (35, 40, 48)

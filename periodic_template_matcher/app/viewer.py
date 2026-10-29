@@ -12,7 +12,7 @@ from .data import SavedPrediction, class_color, load_result, render_view, source
 
 
 MODES = {'叠加': 'overlay', '左右对照': 'split', '原图': 'input', '类别 Mask': 'mask'}
-SOURCES = {'全部预测': 'all', '直接配准': 'direct', '周期补全': 'periodic'}
+SOURCES = {'全部预测': 'all', '直接配准': 'direct', '周期补全': 'periodic', '独立物体': 'objects'}
 
 
 class PredictionViewer(tk.Tk):
@@ -35,6 +35,8 @@ class PredictionViewer(tk.Tk):
         self.source = tk.StringVar(value='全部预测')
         self.opacity = tk.DoubleVar(value=.5)
         self.class_name = tk.StringVar(value='全部前景')
+        self.identity_name = tk.StringVar(value='全部身份')
+        self._identity_ids = [None]
         self.unknown = tk.BooleanVar(value=True)
         self.summary = tk.StringVar(value='打开第一阶段保存的结果目录，查看 input 和预测 mask。')
         self.details = tk.StringVar(value='')
@@ -66,6 +68,10 @@ class PredictionViewer(tk.Tk):
                                     values=['全部前景'], width=22, state='readonly')
         self.classes.pack(side='left', padx=(6, 14))
         self.classes.bind('<<ComboboxSelected>>', lambda event: self.request_render())
+        self.identities = ttk.Combobox(controls, textvariable=self.identity_name,
+                                      values=['全部身份'], width=10, state='readonly')
+        self.identities.pack(side='left', padx=(0, 12))
+        self.identities.bind('<<ComboboxSelected>>', lambda event: self.request_render())
         ttk.Label(controls, text='透明度').pack(side='left')
         ttk.Scale(controls, from_=0, to=1, variable=self.opacity, length=150,
                    command=lambda value: self.request_render()).pack(side='left', padx=6)
@@ -103,6 +109,13 @@ class PredictionViewer(tk.Tk):
             self.details.set(f'{width} × {height} px  |  标签覆盖 {data.valid.mean():.2%}  |  背景 ID=0；紫色斜纹=未知  |  {data.manifest.parent}')
         names = meta.get('class_names', {})
         self._class_ids = [None] + data.class_ids
+        object_info = meta.get('ordered_objects', {})
+        names_by_id = object_info.get('identity_names', {})
+        self._identity_ids = [None] + [int(k) for k in names_by_id]
+        self.identities['values'] = ['全部身份'] + list(names_by_id.values())
+        self.identities.current(0)
+        if object_info:
+            self.summary.set(self.summary.get() + f" | 物体：{object_info['status']} {object_info.get('visible_order', '')}")
         choices = ['全部前景'] + [f"{names.get(str(value), '背景' if value == 0 else '类别')} (ID {value})"
                                    for value in data.class_ids]
         self.classes.configure(values=choices)
@@ -209,6 +222,10 @@ class PredictionViewer(tk.Tk):
             if self.data.valid[y, x]:
                 periodic = self.data.periodic is not None and self.data.periodic[y, x]
                 state = f"类别 ID {self.data.labels[y, x]} · {'周期补全' if periodic else '直接配准'}"
+                if self.data.object_identities is not None and self.data.object_identities[y, x]:
+                    object_id = str(int(self.data.object_identities[y, x]))
+                    identity = self.data.metadata.get('ordered_objects', {}).get('identity_names', {}).get(object_id, object_id)
+                    state = f'类别 ID {self.data.labels[y, x]} · 独立物体 {identity}'
         self.pixel.set(f'原图 x={x}, y={y}  |  {state}  |  缩放 {self.scale:.0%}  |  滚轮缩放 / 拖动平移')
 
     def request_render(self) -> None:
@@ -222,11 +239,13 @@ class PredictionViewer(tk.Tk):
             return
         index = self.classes.current()
         selected = self._class_ids[index] if index >= 0 else None
+        identity_index = self.identities.current()
+        identity = self._identity_ids[identity_index] if identity_index >= 0 else None
         size = (max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
         image = render_view(self.data, size, self.scale, self.origin,
                             mode=MODES[self.mode.get()], alpha=self.opacity.get(),
                             class_id=selected, source=SOURCES[self.source.get()],
-                            show_unknown=self.unknown.get())
+                            show_unknown=self.unknown.get(), object_identity=identity)
         ok, encoded = cv2.imencode('.png', image)
         if not ok:
             raise ValueError('Could not encode viewer frame')

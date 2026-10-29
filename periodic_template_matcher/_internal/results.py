@@ -28,6 +28,8 @@ class MatchResult:
     completed_valid: BoolMask | None = None
     periodic_valid: BoolMask | None = None
     label_periodic_valid: BoolMask | None = None
+    object_identities: LabelMap | None = None
+    object_valid: BoolMask | None = None
 
     @property
     def accepted(self) -> bool:

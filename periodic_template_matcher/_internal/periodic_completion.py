@@ -75,13 +75,9 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
     ts = (round(w*scale), round(h*scale))
     Da = np.diag([ss[0]/source.shape[1], ss[1]/source.shape[0], 1.])
     Db = np.diag([ts[0]/w, ts[1]/h, 1.])
-    vectors = [np.asarray(v, float) for v in cfg.period_vectors]
-    period_source = 'configured'
-    if not vectors:
-        vectors = anchor_vectors(labels, annotation_valid, cfg.periodic_anchor_class)
-        period_source = 'anchor_class'
-    if not vectors:
-        period_source = 'image_autocorrelation'
+
+    def image_vectors() -> list[Array]:
+        inferred = []
         working_size = best.get('working_target_size', ts)
         for axis in (0, 1):
             candidates = [v for v in best.get('lattice_candidates', [])
@@ -89,7 +85,17 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
             if candidates:
                 candidate = min(candidates, key=lambda v: v['vector_work_px'][axis])
                 target_vector = np.asarray(candidate['vector_work_px']) * [w/working_size[0], h/working_size[1]]
-                vectors.append(np.linalg.solve(H[:2, :2], target_vector))
+                inferred.append(np.linalg.solve(H[:2, :2], target_vector))
+        return inferred
+
+    vectors = [np.asarray(v, float) for v in cfg.period_vectors]
+    period_source = 'configured'
+    if not vectors:
+        vectors = anchor_vectors(labels, annotation_valid, cfg.periodic_anchor_class)
+        period_source = 'anchor_class'
+    if not vectors:
+        period_source = 'image_autocorrelation'
+        vectors = image_vectors()
     result.completed_template = result.warped_template.copy()
     result.completed_valid = result.geometric_valid.copy()
     result.periodic_valid = np.zeros((h, w), bool)
@@ -122,6 +128,38 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
     src = _features(source_gray, source_mask)
     dst = _features(target_gray, target_mask)
     local_cfg = replace(cfg, min_overlap=.2)
+    if period_source == 'anchor_class':
+        # One class may contain different objects inside a periodic cell. Their
+        # closest centroid spacing is not necessarily a period of the photograph.
+        validation = []
+        supported = []
+        for vector in vectors:
+            translation = np.eye(3)
+            translation[:2, 2] = Da[:2, :2] @ vector
+            metrics = _score(src, src, translation, local_cfg)
+            accepted = (metrics['structure_ncc'] >= cfg.periodic_min_ncc
+                        and metrics['edge_alignment'] >= cfg.periodic_min_edge)
+            validation.append(dict(vector=vector.tolist(), accepted=bool(accepted), metrics=metrics))
+            if accepted:
+                supported.append(vector)
+        info['anchor_period_validation'] = validation
+        if len(supported) != len(vectors):
+            fallback = image_vectors()
+            vectors = supported.copy()
+            for vector in fallback:
+                # Keep validated anchor axes when autocorrelation finds only one
+                # direction; do not add a parallel harmonic as a second axis.
+                if all(abs(vector[0]*prev[1]-vector[1]*prev[0]) >
+                       .15*np.linalg.norm(vector)*np.linalg.norm(prev) for prev in vectors):
+                    vectors.append(vector)
+                if len(vectors) == 2:
+                    break
+            period_source = 'image_autocorrelation' if len(vectors) > len(supported) else 'anchor_class'
+            info.update(period_source=period_source, period_vectors=[v.tolist() for v in vectors],
+                        period_fallback_reason='anchor_spacing_not_supported_by_image')
+        if not vectors:
+            finish('no_period')
+            return
     offsets = [v for v in product(range(-cfg.periodic_max_steps, cfg.periodic_max_steps+1), repeat=len(vectors))
                if any(v)]
     offsets.sort(key=lambda v: (sum(abs(x) for x in v), v))

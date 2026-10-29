@@ -9,6 +9,8 @@ from typing import Any
 
 
 OPTION_GROUPS = {
+    'objects': {'ordered_object_class', 'object_cycle', 'object_min_score', 'object_min_gap',
+                'object_min_visible', 'object_candidates'},
     'step1': {'scale', 'max_side', 'bottom_ignore_fraction', 'valid_height'},
     'step2': {'backend', 'angles', 'scales', 'peaks_per_hypothesis', 'seed'},
     'step3': {'refine_candidates', 'ecc_iterations', 'edge_tolerance_px',
@@ -47,6 +49,12 @@ class MatcherConfig:
     periodic_min_ncc: float = .75
     periodic_min_edge: float = .6
     scale: float | None = None  # Shared working resolution; None uses max_side.
+    ordered_object_class: int | None = None
+    object_cycle: Sequence[str] = ('A', 'B', 'C')
+    object_min_score: float = .7
+    object_min_gap: float = .03
+    object_min_visible: float = .15
+    object_candidates: int = 8
 
     @classmethod
     def from_options(cls, options: dict[str, Any]) -> MatcherConfig:
@@ -82,6 +90,20 @@ class MatcherConfig:
             1.0, self.max_side / max(max(shape[:2]) for shape in shapes))
 
     def validate(self) -> None:
+        if self.ordered_object_class is not None and self.label_mode != 'semantic':
+            raise ValueError('Ordered object matching requires semantic label mode')
+        if self.ordered_object_class is not None and (type(self.ordered_object_class) is not int
+                                                      or not 1 <= self.ordered_object_class <= 65535):
+            raise ValueError('ordered_object_class must be a class ID or None')
+        if (not isinstance(self.object_cycle, (list, tuple)) or len(self.object_cycle) != 3
+                or any(not isinstance(v, str) or not v for v in self.object_cycle)
+                or len(set(self.object_cycle)) != 3):
+            raise ValueError('object_cycle must contain three unique nonempty identity names')
+        if (not 0 < self.object_min_visible <= 1 or not 0 <= self.object_min_score <= 1
+                or not 0 <= self.object_min_gap <= 1):
+            raise ValueError('invalid object score, margin or visibility threshold')
+        if type(self.object_candidates) is not int or not 1 <= self.object_candidates <= 16:
+            raise ValueError('object_candidates must be an integer in 1..16')
         if self.scale is not None and (type(self.scale) not in (int, float)
                                       or not isfinite(self.scale) or not 0 < self.scale <= 1):
             raise ValueError('scale must be finite in (0, 1] or None')

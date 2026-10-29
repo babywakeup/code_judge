@@ -13,7 +13,7 @@ from ..config import MatcherConfig
 from ..matcher import PeriodicTemplateMatcher
 from ..utils import read_image
 from ..utils.types import Diagnostics, PathInput, Resolver
-from .annotations import load_labels
+from .annotations import load_labels, load_objects
 from .result_io import ARTIFACTS
 
 
@@ -28,6 +28,7 @@ def unique_templates(
                      for key in ('labels', 'labelme', 'annotation_valid', 'valid_mask')}
         signature['class_map'] = item.get('class_map', {})
         signature['valid_height'] = item.get('valid_height')
+        signature['object_order'] = item.get('object_order')
         name = item.get('name', f'template_{index + 1}')
         if digest in seen:
             previous, original_signature = seen[digest]
@@ -60,6 +61,8 @@ def run_config(config_path: PathInput, output_dir: PathInput) -> Diagnostics:
     tv = read_image(resolve(spec['target_valid_mask']), cv2.IMREAD_GRAYSCALE) if spec.get('target_valid_mask') else None
     # Validate even non-selected annotations, so a bad template cannot hide silently.
     labels = [load_labels(s, resolve, im.shape[:2]) for s, im in zip(specs, images)]
+    objects = [load_objects(s, resolve, im.shape[:2], cfg.ordered_object_class, cfg.object_cycle)
+               for s, im in zip(specs, images)] if cfg.ordered_object_class is not None else None
     # Annotation knowledge and image ROI are intersected once inside match().
     annotation_valids = [read_image(resolve(s['annotation_valid']), cv2.IMREAD_GRAYSCALE)
                         if s.get('annotation_valid') else None for s in specs]
@@ -69,7 +72,8 @@ def run_config(config_path: PathInput, output_dir: PathInput) -> Diagnostics:
                             annotation_valids=annotation_valids,
                             target_valid=tv,
                             template_valid_heights=[s.get('valid_height') for s in specs],
-                            target_valid_height=spec.get('target_valid_height'))
+                            target_valid_height=spec.get('target_valid_height'),
+                            template_objects=objects)
     result = matched.registration
     result.update(template_names=[s['name'] for s in specs], target=str(resolve(spec['target'])),
                   input_template_count=len(spec['templates']), unique_template_count=len(specs),
