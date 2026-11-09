@@ -1,0 +1,71 @@
+{
+  "folders": [
+    { "name": "repo", "path": ".." },
+    { "name": "ptm", "path": "." }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "${workspaceFolder:repo}/.venv/Scripts/python.exe",
+    "C_Cpp.default.compileCommands": "${workspaceFolder:ptm}/build/debug/compile_commands.json"
+  },
+  "extensions": {
+    "recommendations": ["vadimcn.vscode-lldb", "ms-vscode.cpptools", "ms-python.python"]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "PTM workspace: build Debug",
+        "type": "process",
+        "command": "${workspaceFolder:repo}/.venv/Scripts/python.exe",
+        "args": ["${workspaceFolder:ptm}/build.py", "--config", "Debug"],
+        "options": { "cwd": "${workspaceFolder:repo}" },
+        "group": { "kind": "build", "isDefault": true },
+        "problemMatcher": []
+      },
+      {
+        "label": "PTM workspace: build Release",
+        "type": "process",
+        "command": "${workspaceFolder:repo}/.venv/Scripts/python.exe",
+        "args": ["${workspaceFolder:ptm}/build.py", "--config", "Release", "--jobs", "2"],
+        "options": { "cwd": "${workspaceFolder:repo}" },
+        "group": "build",
+        "problemMatcher": []
+      }
+    ]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "PTM: built-in smoke",
+        "type": "lldb",
+        "request": "launch",
+        "program": "${workspaceFolder:ptm}/build/debug/ptm_debug.exe",
+        "args": [],
+        "cwd": "${workspaceFolder:repo}",
+        "preLaunchTask": "PTM workspace: build Debug",
+        "sourceMap": { "D:/codes/code_judge": "${workspaceFolder:repo}" },
+        "stopOnEntry": false
+      },
+      {
+        "name": "PTM: exported fixture",
+        "type": "lldb",
+        "request": "launch",
+        "program": "${workspaceFolder:ptm}/build/debug/ptm_debug.exe",
+        "args": ["${input:fixturePath}"],
+        "cwd": "${workspaceFolder:repo}",
+        "preLaunchTask": "PTM workspace: build Debug",
+        "sourceMap": { "D:/codes/code_judge": "${workspaceFolder:repo}" },
+        "stopOnEntry": false
+      }
+    ],
+    "inputs": [
+      {
+        "id": "fixturePath",
+        "type": "promptString",
+        "description": "Absolute or repository-relative path to an already exported fixture manifest",
+        "default": "periodic_template_matcher_cpp/build/debug/fixtures/smoke/fixture.json"
+      }
+    ]
+  }
+}

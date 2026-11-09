@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher
-from periodic_template_matcher._internal.evaluation import evaluate_segmentation
+from periodic_template_matcher._internal.segmentation.evaluation import evaluate_segmentation
 from periodic_template_matcher.utils import read_image, warp_labels
 from periodic_template_matcher.utils.masks import normalize_masks
 from periodic_template_matcher.app.data import load_result
@@ -135,8 +135,8 @@ class MatcherApiTests(unittest.TestCase):
         self.assertEqual(evaluated.metrics['pixel_accuracy'], 0.)
         self.assertIsNone(evaluated.metrics['overlap_only']['mean_iou'])
 
-    def test_target_roi_and_bottom_exclusion_are_respected(self):
-        self.matcher.config.bottom_ignore_fraction = .08
+    def test_target_roi_and_valid_height_are_respected(self):
+        self.matcher.config.valid_height = 147
         roi = np.ones_like(self.labels)
         roi[:20] = 0
         with patch('periodic_template_matcher.matcher.select_templates', return_value=selection()):

@@ -42,7 +42,7 @@ class OrderedObjectTests(unittest.TestCase):
         return MatcherConfig(**options)
 
     def detect(self, order, offset=0, cfg=None):
-        from periodic_template_matcher._internal.ordered_objects import match_ordered_objects
+        from periodic_template_matcher._internal.objects.matching import match_ordered_objects
         source, _, refs, _ = scene()
         target, truth, _, ids = scene(order, offset)
         valid = np.ones(source.shape, np.uint8)
@@ -75,7 +75,7 @@ class OrderedObjectTests(unittest.TestCase):
         self.assertFalse(result.valid.all())
 
     def test_noise_cannot_be_filled_by_order_alone(self):
-        from periodic_template_matcher._internal.ordered_objects import match_ordered_objects
+        from periodic_template_matcher._internal.objects.matching import match_ordered_objects
         source, _, refs, _ = scene()
         target = np.random.default_rng(17).integers(0, 255, source.shape, dtype=np.uint8)
         valid = np.ones(source.shape, np.uint8)
@@ -85,7 +85,7 @@ class OrderedObjectTests(unittest.TestCase):
         self.assertFalse(result.valid.all())
 
     def test_identical_appearances_remain_ambiguous_at_scene_threshold(self):
-        from periodic_template_matcher._internal.ordered_objects import match_ordered_objects
+        from periodic_template_matcher._internal.objects.matching import match_ordered_objects
         source, _, refs, _ = scene()
         for i in (1, 2):
             source[:, 26+i*80:54+i*80] = source[:, 26:54]
@@ -96,7 +96,7 @@ class OrderedObjectTests(unittest.TestCase):
         self.assertFalse(result.valid.any())
 
     def test_clipped_source_cannot_claim_unseen_object_extent_is_background(self):
-        from periodic_template_matcher._internal.ordered_objects import match_ordered_objects
+        from periodic_template_matcher._internal.objects.matching import match_ordered_objects
         source, _, refs, _ = scene('ABC', -43)
         target, truth, _, _ = scene()
         valid = np.ones(source.shape, np.uint8)
@@ -117,7 +117,7 @@ class OrderedObjectTests(unittest.TestCase):
             self.cfg(label_mode='instance').validate()
 
     def test_small_vertical_fragment_does_not_outrank_full_object(self):
-        from periodic_template_matcher._internal.ordered_objects import match_ordered_objects
+        from periodic_template_matcher._internal.objects.matching import match_ordered_objects
         source, _, refs, _ = scene()
         source = np.tile(source, (6, 1))
         refs = [dict(ref, mask=np.tile(ref['mask'], (6, 1))) for ref in refs]
@@ -132,7 +132,7 @@ class OrderedObjectTests(unittest.TestCase):
         self.assertTrue(all(obj['visible_fraction'] > .8 for obj in result.diagnostics['objects']))
 
     def test_original_annotation_instances_and_config_routing(self):
-        from periodic_template_matcher._internal.annotations import load_objects
+        from periodic_template_matcher._internal.io.annotations import load_objects
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             image, labels, objects, _ = scene()
@@ -168,6 +168,8 @@ class OrderedObjectTests(unittest.TestCase):
             metadata = json.loads(path.read_text(encoding='utf-8'))
             self.assertEqual(metadata['ordered_objects']['visible_order'], 'CAB')
             np.testing.assert_array_equal(read_image(Path(temp)/'object_identities.png', -1), ids)
+            np.testing.assert_array_equal(read_image(Path(temp)/'base_labels.png', -1), result.base_labels)
+            np.testing.assert_array_equal(read_image(Path(temp)/'base_valid.png', -1) > 0, result.base_valid)
             from periodic_template_matcher.app.data import load_result, render_view
             data = load_result(temp)
             np.testing.assert_array_equal(data.object_identities, ids)
@@ -223,6 +225,8 @@ class OrderedObjectTests(unittest.TestCase):
             with patch('periodic_template_matcher.matcher.select_templates', return_value=selected):
                 run_config(path, root/'out')
             self.assertFalse((root/'out/object_identities.png').exists())
+            self.assertFalse((root/'out/base_labels.png').exists())
+            self.assertFalse((root/'out/base_valid.png').exists())
 
 
 if __name__ == '__main__':

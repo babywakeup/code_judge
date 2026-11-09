@@ -7,7 +7,7 @@ from pathlib import Path
 import argparse
 import json
 
-from ._internal.workflow import run_config
+from ._internal.io.workflow import run_config
 
 
 def main(argv: Sequence[str] | None = None) -> None:

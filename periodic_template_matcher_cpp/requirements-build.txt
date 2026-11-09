@@ -1,0 +1,4 @@
+# Build-only tools; Python development headers and OpenCV C++ SDK are also needed.
+cmake>=3.20,<5
+ninja>=1.11,<2
+pybind11>=3.0,<4

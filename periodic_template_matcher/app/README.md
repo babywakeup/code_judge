@@ -30,8 +30,8 @@ manifest = matcher.save_result(result, "periodic_template_matcher/results/my_pre
 - 视图：原图、类别 Mask、透明叠加、左右对照。左右对照时，两侧共用缩放和平移位置。
 - 类别：默认显示所有前景；也可选择单个类别，包括背景 ID 0。颜色只用于显示，保存的 mask 仍是整数类别 ID。
 - 来源：全部预测、直接配准、周期补全、独立物体。最终标签已包含在 `mapped_labels.png` 中。
-- 身份：启用类别 2 独立匹配后，可单独查看 A/B/C 身份；
-  类别 2 不跟随类别 1 周期复制。灰度身份图的 1/2/3 与语义类别 ID 分开使用。
+- 身份：启用类别 2 独立匹配后，可单独查看配置中的 N 个身份；
+  类别 2 不跟随类别 1 周期复制。灰度身份图的 1..N 与语义类别 ID 分开使用。
 - 跨边界前景：与未知区域相连的周期物体会补齐其在背景上的完整部分；这些新增前景也归入“周期补全”，已有非零标签不会被覆盖。
 - 透明度：调整标签颜色与 input 的混合比例。
 - 未知区域：紫色斜纹表示 `label_valid=0`，与背景类别 0 分开显示。
@@ -49,8 +49,9 @@ manifest = matcher.save_result(result, "periodic_template_matcher/results/my_pre
 | `mapped_labels.png` | `uint16` 类别 ID 图，只有有效预测时存在 |
 | `label_valid.png` | 0/255 标签有效区域 |
 | `label_periodic_valid.png` | 可选，周期补齐产生的标签区域 |
-| `object_identities.png` | 可选，1/2/3 的独立物体身份图，0 为无已接受身份 |
+| `object_identities.png` | 可选，1..N 的独立物体身份图，0 为无已接受身份 |
 | `object_valid.png` | 可选，独立物体分支的预测有效范围 |
+| `base_labels.png` / `base_valid.png` | 可选，合并独立实例之前的基础标签及有效范围，保留原配准和周期补全结果 |
 | `geometric_valid.png` | 直接配准的图像有效重叠区域 |
 | `matrix_template_to_target.npy` | 可选，模板原图到 input 原图的变换矩阵 |
 | `result.json` | 匹配信息、预测状态、类别统计、相对文件清单 |

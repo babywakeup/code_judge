@@ -5,8 +5,8 @@ file-based JSON workflow, and utils for image IO. _internal is not public API.
 """
 from .config import MatcherConfig
 from .matcher import PeriodicTemplateMatcher
-from ._internal.results import EvaluationResult, MatchResult
-from ._internal.workflow import run_config
+from ._internal.models import EvaluationResult, MatchResult
+from ._internal.io.workflow import run_config
 
 __all__ = [
     'MatcherConfig', 'PeriodicTemplateMatcher', 'MatchResult', 'EvaluationResult',

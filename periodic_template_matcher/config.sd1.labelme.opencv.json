@@ -1,12 +1,18 @@
 {
-  "target": "../source/SD-1/10-21/Tlink-Image-1792571343428.jpeg",
+  "target": "../source/SD-1/imgs/TN4HI1/18851_AFE55CS025A_TDAOI810_71_78.715_236.172_O_M_20260124_135701.jpg",
   "target_valid_height": 1891,
   "templates": [
     {
       "name": "SD1_1258237",
+      "instance_layouts": {
+        "2": {
+          "order_axis": "x",
+          "order": ["A", "B", "C"]
+        }
+      },
       "valid_height": 1891,
-      "image": "../source/SD-1/templates/18851_AFE568N05MA_TDAOI520_75_-332.651_-750.175_O_S_20260921_084833.jpg",
-      "labelme": "../source/SD-1/templates/18851_AFE568N05MA_TDAOI520_75_-332.651_-750.175_O_S_20260921_084833.json",
+      "image": "../source/SD-1/templates2/18851_AFE568N05MA_TDAOI520_75_-332.651_-750.175_O_S_20260921_084833.jpg",
+      "labelme": "../source/SD-1/templates2/18851_AFE568N05MA_TDAOI520_75_-332.651_-750.175_O_S_20260921_084833.json",
       "class_map": {
         "1": 1,
         "2": 2
@@ -14,9 +20,15 @@
     },
     {
       "name": "SD1_1371308",
+      "instance_layouts": {
+        "2": {
+          "order_axis": "x",
+          "order": ["D", "A", "B"]
+        }
+      },
       "valid_height": 1891,
-      "image": "../source/SD-1/templates/18851_AFE568N05UA_TDAOI520_340_-192.681_-455.144_O_S_20260921_082643.jpg",
-      "labelme": "../source/SD-1/templates/18851_AFE568N05UA_TDAOI520_340_-192.681_-455.144_O_S_20260921_082643.json",
+      "image": "../source/SD-1/templates2/18851_AFE568N05UA_TDAOI520_340_-192.681_-455.144_O_S_20260921_082643.jpg",
+      "labelme": "../source/SD-1/templates2/18851_AFE568N05UA_TDAOI520_340_-192.681_-455.144_O_S_20260921_082643.json",
       "class_map": {
         "1": 1,
         "2": 2
@@ -26,15 +38,33 @@
   "label_mode": "semantic",
   "demo_annotations": false,
   "options": {
+    "classes": {
+      "1": {
+        "description": "类别1：横向、纵向都具有平移重复性（周期>1）。",
+        "repeat_axes": ["x", "y"]
+      },
+      "2": {
+        "description": "类别2：完整身份周期为ABCD，输入横向只出现连续3个身份，边缘允许截断；联合所有模板参考定位，横向不复制，纵向可验证补全。",
+        "repeat_axes": ["y"],
+        "instance_matching": {
+          "cycle": ["A", "B", "C", "D"],
+          "visible_count": 3,
+          "min_score": 0.7,
+          "min_gap": 0.02,
+          "min_visible": 0.15,
+          "spacing_weight": 0.3
+        }
+      }
+    },
     "step1": {
       "description": "预处理：设置有效区域，统一缩放模板和输入图像；scale 为 null 时根据 max_side 自动计算倍率。",
       "max_side": 800,
-      "scale": null,
-      "bottom_ignore_fraction": 0.08
+      "scale": null
     },
     "step2": {
       "description": "粗匹配：在缩放后的图像上枚举模板的 angles 和 scales 组合，搜索平移位置并生成候选。",
       "backend": "opencv",
+      "template_workers": 0,
       "angles": [
         0
       ],
@@ -51,7 +81,7 @@
       "ecc_iterations": 70
     },
     "periodic": {
-      "description": "周期补全：验证并补齐未覆盖区域及跨边界的完整前景结构，保留已有非零类别标签。",
+      "description": "启用周期补全，方向权限由classes中各类别的repeat_axes声明；周期像素距离独立自动估计，保留已有前景和白色缺陷下的标签迁移。",
       "periodic_completion": true
     }
   }

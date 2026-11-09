@@ -1,0 +1,1 @@
+"""Segmentation domain: preparation, label transfer, periodic fill and evaluation."""

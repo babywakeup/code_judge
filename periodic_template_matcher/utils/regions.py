@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import isfinite
 
 import cv2
 import numpy as np
@@ -17,31 +16,26 @@ from .types import Diagnostics, Image, Mask, Size
 class ValidRegion:
     """Valid top rows [0, valid_height), intersected with an optional image mask.
 
-    Height is in original-image pixels and overrides the legacy bottom fraction.
+    Height is in original-image pixels; None keeps the full image height.
     The full-size mask preserves image coordinates, labels and output dimensions.
     """
 
     valid_height: int | None = None
-    bottom_ignore_fraction: float = 0.
 
     @classmethod
     def from_config(cls, config: MatcherConfig, valid_height: int | None = None) -> ValidRegion:
         height = config.valid_height if valid_height is None else valid_height
-        return cls(height, config.bottom_ignore_fraction)
+        return cls(height)
 
     def resolved_height(self, image: Image) -> int:
         if not isinstance(image, np.ndarray) or image.ndim not in (2, 3) or min(image.shape[:2]) < 1:
             raise ValueError('ValidRegion requires a nonempty image array')
         height = image.shape[0]
-        if (not isinstance(self.bottom_ignore_fraction, (int, float))
-                or not isfinite(self.bottom_ignore_fraction)
-                or not 0 <= self.bottom_ignore_fraction < .5):
-            raise ValueError('bottom_ignore_fraction must be finite in [0, .5)')
         if self.valid_height is not None:
             if type(self.valid_height) is not int or not 1 <= self.valid_height <= height:
                 raise ValueError(f'valid_height must be an integer in 1..{height}')
             return self.valid_height
-        return int(height*(1-self.bottom_ignore_fraction))
+        return height
 
     def build_mask(self, image: Image, mask: Mask | None = None) -> Mask:
         """Return a new HxW uint8 image ROI, never annotation knowledge."""
@@ -82,4 +76,4 @@ class ValidRegion:
         """JSON-safe record of the resolved image region, including mask holes."""
         return dict(image_height=int(image.shape[0]), image_width=int(image.shape[1]),
                     valid_height=self.resolved_height(image), valid_pixels=int(mask.sum()),
-                    height_source='explicit' if self.valid_height is not None else 'bottom_fraction')
+                    height_source='explicit' if self.valid_height is not None else 'full_image')

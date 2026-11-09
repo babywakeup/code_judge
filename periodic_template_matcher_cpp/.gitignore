@@ -1,0 +1,9 @@
+build/
+.deps/
+_native*.pyd
+_native*.so
+*.dll
+__pycache__/
+*.pdb
+*.exp
+*.lib

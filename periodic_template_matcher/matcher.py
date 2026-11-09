@@ -4,20 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import asdict, replace
 from pathlib import Path
 
-import cv2
-import numpy as np
-
-from ._internal.evaluation import evaluate_segmentation
-from ._internal.periodic_completion import complete_periodic
-from ._internal.ordered_objects import match_ordered_objects
-from ._internal.registration import select_templates
-from ._internal.results import EvaluationResult, MatchResult
-from ._internal.result_io import save_result
+from ._internal.objects.matching import match_ordered_objects
+from ._internal.objects.completion import complete_object_support
+from ._internal.pipeline import MatchPipeline
+from ._internal.registration.core import select_templates
+from ._internal.models import EvaluationResult, MatchResult
+from ._internal.io.export import save_result
+from ._internal.segmentation.evaluation import SegmentationEvaluationStep
+from ._internal.objects.steps import ObjectSupportCompletionStep, OrderedObjectStep
+from ._internal.segmentation.preparation import InputPreparationStep
+from ._internal.registration.step import RegistrationStep
 from .config import MatcherConfig
-from .utils import ValidRegion, normalize_masks, validate_image, warp_labels, warp_valid_mask
 from .utils.types import Diagnostics, Image, LabelInput, Mask, PathInput
 
 
@@ -39,15 +38,8 @@ class PeriodicTemplateMatcher:
     @staticmethod
     def _valids(values: Sequence[Mask | None] | None, images: Sequence[Image],
                 name: str) -> Sequence[Mask | None]:
-        """Check optional per-template masks; None entries mean no extra restriction."""
-        if values is None:
-            return [None] * len(images)
-        if not isinstance(values, Sequence) or len(values) != len(images):
-            raise ValueError(f'{name} must have one entry per template')
-        for mask, image in zip(values, images):
-            if mask is not None and (not isinstance(mask, np.ndarray) or mask.shape != image.shape[:2]):
-                raise ValueError(f'{name} entries must match image height and width')
-        return values
+        """Compatibility delegate; validation belongs to InputPreparationStep."""
+        return InputPreparationStep.validate_masks(values, images, name)
 
     def match(self, templates: Sequence[Image], masks: Sequence[LabelInput | None],
               input: Image, *, template_valids: Sequence[Mask | None] | None = None,
@@ -62,123 +54,25 @@ class PeriodicTemplateMatcher:
         known template labels; zero is otherwise known background. Explicit valid
         heights are original-pixel top-row counts, overriding default exclusions.
         """
-        self.config.validate()
-        if not isinstance(templates, Sequence) or not templates:
-            raise ValueError('templates must be a nonempty list of images')
-        for image in [*templates, input]:
-            if not isinstance(image, np.ndarray):
-                raise ValueError('Images must be numpy arrays; use read_image for file paths')
-            validate_image(image)
-        if not isinstance(masks, Sequence) or len(masks) != len(templates):
-            raise ValueError('masks must have one entry per template (None is allowed)')
-        labels = [None if mask is None else normalize_masks(mask, image.shape[:2], f'masks[{i}]')
-                  for i, (mask, image) in enumerate(zip(masks, templates))]
-        valids = self._valids(template_valids, templates, 'template_valids')
-        annotations = self._valids(annotation_valids, templates, 'annotation_valids')
-        # Region construction also checks the target mask's shape.
-        valids, target_mask, regions = self._prepare_regions(
-            templates, input, valids, target_valid, template_valid_heights, target_valid_height)
-        objects = None
-        if self.config.ordered_object_class is not None:
-            if template_objects is None or len(template_objects) != len(templates):
-                raise ValueError('ordered matching requires template_objects for every template')
-            objects = []
-            for refs, image, valid, annotation in zip(template_objects, templates, valids, annotations):
-                names = [r.get('identity') for r in refs]
-                if len(names) != len(self.config.object_cycle) or set(names) != set(self.config.object_cycle):
-                    raise ValueError('Each template must provide each ordered identity exactly once')
-                prepared = []
-                for ref in refs:
-                    mask = ref.get('mask')
-                    if not isinstance(mask, np.ndarray) or mask.shape != image.shape[:2] or not (mask > 0).any():
-                        raise ValueError('Object reference mask must be nonempty and source-sized')
-                    background_known = annotation is None or np.array_equal((annotation > 0) & (valid > 0), valid > 0)
-                    prepared.append(dict(ref, background_known=background_known))
-                objects.append(prepared)
-        # Heights and masks are already resolved. Do not exclude rows a second time.
-        registration_config = replace(self.config, valid_height=None, bottom_ignore_fraction=0.)
-        registration = select_templates(templates, input, registration_config, valids,
-                                        target_mask, self.config.label_mode)
-        registration.update(config=asdict(self.config), valid_regions=regions)
-        index = registration['ranking'][0]
-        source = templates[index]
-        best = registration['matches'][index]
-        H = best.get('matrix_template_to_target')
-        result = MatchResult(registration, input, source, None, np.zeros(input.shape[:2], bool))
-        if H is None:
-            return result
-        H = np.asarray(H, np.float64)
-        target_roi = target_mask > 0
-        source_roi = valids[index].copy()
-        result.warped_template = cv2.warpPerspective(source, H, (input.shape[1], input.shape[0]))
-        result.geometric_valid = warp_valid_mask(source_roi, H, input.shape)
-        result.geometric_valid &= target_roi
-        object_prediction = None
-        if objects is not None and self.config.label_mode == 'semantic':
-            # Independently identify objects using all valid source examples. A
-            # template score tie is resolved only by strong ordered image evidence.
-            object_valids = [v if a is None else v*(a > 0).astype(np.uint8) for v, a in zip(valids, annotations)]
-            matrices = [m.get('matrix_template_to_target') if m.get('geometry_accepted', result.accepted) else None
-                        for m in registration['matches']]
-            object_prediction = match_ordered_objects(templates, objects, object_valids, input,
-                                                      target_mask, matrices, self.config)
-            registration['ordered_objects'] = object_prediction.diagnostics
-            if (not result.accepted and registration['status'] == 'templates_too_close'
-                    and object_prediction.diagnostics['status'] == 'accepted'):
-                registration.update(accepted=True, status='accepted_ordered_objects',
-                                    template_selection_ambiguous=True)
-        if result.accepted and labels[index] is not None:
-            if annotations[index] is not None:
-                source_roi &= (annotations[index] > 0).astype(np.uint8)
-            transfer_labels = labels[index]
-            if objects is not None:
-                # The ordered class is never transferred by a global lattice.
-                transfer_labels = transfer_labels.copy()
-                transfer_labels[transfer_labels == self.config.ordered_object_class] = 0
-            mapped, valid = warp_labels(transfer_labels, H, input.shape, source_roi)
-            valid &= target_roi
-            mapped[~valid] = 0
-            result.mapped_labels, result.label_valid = mapped, valid
-            if self.config.periodic_completion and self.config.label_mode == 'semantic':
-                complete_periodic(result, transfer_labels, source_roi,
-                                  valids[index],
-                                  target_roi, self.config)
-            if object_prediction is not None:
-                positive = object_prediction.labels > 0
-                result.mapped_labels[positive] = object_prediction.labels[positive]
-                result.object_identities = object_prediction.identities
-                result.object_valid = object_prediction.valid
-                # A periodic background is not evidence that class 2 is absent.
-                result.label_valid = ((result.label_valid & object_prediction.valid)
-                                      | positive | (result.mapped_labels == self.config.periodic_anchor_class)) & target_roi
-                result.mapped_labels[~result.label_valid] = 0
-                if result.label_periodic_valid is not None:
-                    result.label_periodic_valid &= result.label_valid & ~positive
-                if 'periodic_completion' in registration:
-                    info = registration['periodic_completion']
-                    missing = int((target_roi & ~result.label_valid).sum())
-                    info.update(status='complete' if not missing else 'incomplete',
-                                label_coverage_roi=float(result.label_valid.sum()/target_roi.sum()),
-                                remaining_unknown_pixels=missing)
-        return result
+        prepared = InputPreparationStep(self.config).run(
+            templates, masks, input, template_valids=template_valids,
+            annotation_valids=annotation_valids, target_valid=target_valid,
+            template_valid_heights=template_valid_heights, target_valid_height=target_valid_height,
+            template_objects=template_objects)
+        # Keep existing algorithm injection points while steps own their policies.
+        pipeline = MatchPipeline(
+            self.config, registration=RegistrationStep(select_templates),
+            ordered_objects=OrderedObjectStep(match_ordered_objects),
+            object_support=ObjectSupportCompletionStep(complete_object_support))
+        return pipeline.run(prepared)
 
     def _prepare_regions(self, templates: Sequence[Image], input: Image,
                          valids: Sequence[Mask | None], target_valid: Mask | None,
                          template_valid_heights: Sequence[int | None] | None,
                          target_valid_height: int | None) -> tuple[list[Mask], Mask, Diagnostics]:
-        """Resolve per-image policy before feature extraction or template selection."""
-        heights = template_valid_heights
-        if heights is None:
-            heights = [None]*len(templates)
-        if not isinstance(heights, Sequence) or len(heights) != len(templates):
-            raise ValueError('template_valid_heights must have one entry per template')
-        policies = [ValidRegion.from_config(self.config, height) for height in heights]
-        masks = [policy.build_mask(image, mask) for policy, image, mask in zip(policies, templates, valids)]
-        target_policy = ValidRegion.from_config(self.config, target_valid_height)
-        target_mask = target_policy.build_mask(input, target_valid)
-        info = dict(templates=[policy.describe(image, mask) for policy, image, mask in zip(policies, templates, masks)],
-                    target=target_policy.describe(input, target_mask))
-        return masks, target_mask, info
+        """Compatibility delegate; ROI construction belongs to InputPreparationStep."""
+        return InputPreparationStep(self.config).prepare_regions(
+            templates, input, valids, target_valid, template_valid_heights, target_valid_height)
 
     def evaluate(self, templates: Sequence[Image], masks: Sequence[LabelInput | None],
                  input: Image, input_masks: LabelInput, *, input_valid: Mask | None = None,
@@ -194,27 +88,13 @@ class PeriodicTemplateMatcher:
         excludes unknown GT. Score=100*mIoU on full GT ROI, including uncovered
         foreground as FN. Rejected/unannotated matches or empty ROI score None.
         """
-        if not isinstance(input, np.ndarray):
-            raise ValueError('input must be a numpy image array')
-        validate_image(input)
-        truth = normalize_masks(input_masks, input.shape[:2], 'input_masks')
-        self._valids([input_valid], [input], 'input_valid')
-        roi = ValidRegion.from_config(self.config, target_valid_height).build_mask(input, target_valid) > 0
-        if input_valid is not None:
-            roi &= input_valid > 0
+        evaluation = SegmentationEvaluationStep(self.config)
+        truth = evaluation.prepare(input, input_masks, input_valid, target_valid, target_valid_height)
         matched = self.match(templates, masks, input, template_valids=template_valids,
                              annotation_valids=annotation_valids, target_valid=target_valid,
                              template_valid_heights=template_valid_heights, target_valid_height=target_valid_height,
                              template_objects=template_objects)
-        if matched.mapped_labels is None:
-            metrics = dict(status='match_rejected' if not matched.accepted else 'no_template_annotations',
-                           score=None, mean_iou=None, mean_dice=None, pixel_accuracy=None,
-                           prediction_coverage=0.0 if roi.any() else None,
-                           evaluated_pixels=0, per_class=[], overlap_only=None)
-        else:
-            metrics = evaluate_segmentation(matched.mapped_labels, truth, matched.label_valid,
-                                            roi, include_background=self.config.include_background)
-        return EvaluationResult(matched, metrics, truth, roi)
+        return evaluation.run(matched, truth)
 
     def save_result(self, result: MatchResult | EvaluationResult,
                     output_dir: PathInput) -> Path:

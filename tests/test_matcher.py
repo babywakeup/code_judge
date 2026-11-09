@@ -9,9 +9,9 @@ import cv2
 import numpy as np
 
 from periodic_template_matcher import MatcherConfig, run_config
-from periodic_template_matcher._internal.registration import register, select_templates
-from periodic_template_matcher._internal.annotations import load_labels
-from periodic_template_matcher._internal.workflow import unique_templates
+from periodic_template_matcher._internal.registration.core import register, select_templates
+from periodic_template_matcher._internal.io.annotations import load_labels
+from periodic_template_matcher._internal.io.workflow import unique_templates
 from periodic_template_matcher.utils import read_image, warp_labels, write_image
 from tests.helpers import texture
 
@@ -30,7 +30,7 @@ class RegistrationTests(unittest.TestCase):
         np.testing.assert_array_equal(mask, [[1, 1, 1, 1], [1, 0, 1, 1], [1, 1, 1, 1]])
 
     def test_multiple_templates_share_target_features_and_period_detection(self):
-        from periodic_template_matcher._internal import registration
+        from periodic_template_matcher._internal.registration import core as registration
         source = texture()
         with patch.object(registration, '_features', wraps=registration._features) as features:
             with patch.object(registration, '_periods', wraps=registration._periods) as periods:

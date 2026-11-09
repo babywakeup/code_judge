@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher, run_config
-from periodic_template_matcher._internal.registration import _translation_peaks
+from periodic_template_matcher._internal.registration.core import _translation_peaks
 from periodic_template_matcher.utils import write_image
 from tests.helpers import texture
 
@@ -21,7 +21,7 @@ class OpenCVBackendTests(unittest.TestCase):
             MatcherConfig(backend='unknown').validate()
 
     def test_coarse_search_matches_fft_with_masks_and_signed_shifts(self):
-        from periodic_template_matcher._internal.opencv_registration import translation_peaks
+        from periodic_template_matcher._internal.registration.opencv import translation_peaks
         rng = np.random.default_rng(18)
         source = rng.random((48, 60), dtype=np.float32)
         sm = np.ones_like(source, np.uint8)
@@ -45,7 +45,7 @@ class OpenCVBackendTests(unittest.TestCase):
                     self.assertAlmostEqual(actual[0][0], expected[0][0], places=4)
 
     def test_empty_overlap_and_zero_energy(self):
-        from periodic_template_matcher._internal.opencv_registration import translation_peaks
+        from periodic_template_matcher._internal.registration.opencv import translation_peaks
         source = np.zeros((40, 50), np.float32)
         ones = np.ones_like(source, np.uint8)
         self.assertEqual(translation_peaks(source, source, ones, ones, MatcherConfig()), [])

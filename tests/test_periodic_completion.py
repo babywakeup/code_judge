@@ -125,7 +125,7 @@ class PeriodicCompletionTests(unittest.TestCase):
         self.assertEqual(result.registration['periodic_completion']['status'], 'incomplete')
 
     def test_invalid_roi_and_rejection_are_respected(self):
-        result, _ = self.matched(cfg=self.cfg(bottom_ignore_fraction=.08))
+        result, _ = self.matched(cfg=self.cfg(valid_height=int(240*.92)))
         end = int(240*.92)
         self.assertTrue(result.label_valid[:end].all())
         self.assertFalse(result.label_valid[end:].any())
@@ -138,7 +138,7 @@ class PeriodicCompletionTests(unittest.TestCase):
         mask = np.ones(target.shape, np.uint8)
         mask[80:95, 80:95] = 0
         with patch('periodic_template_matcher.matcher.select_templates', return_value=selection(True, H)):
-            result = PeriodicTemplateMatcher(self.cfg(bottom_ignore_fraction=.2)).match(
+            result = PeriodicTemplateMatcher(self.cfg()).match(
                 [source], [labels], target, template_valid_heights=[210],
                 target_valid_height=220, target_valid=mask)
         self.assertFalse(result.label_valid[220:].any())

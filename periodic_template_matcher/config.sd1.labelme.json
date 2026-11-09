@@ -28,8 +28,7 @@
     "step1": {
       "description": "预处理：设置有效区域，统一缩放模板和输入图像；scale 为 null 时根据 max_side 自动计算倍率。",
       "max_side": 800,
-      "scale": null,
-      "bottom_ignore_fraction": 0.08
+      "scale": null
     },
     "step2": {
       "description": "粗匹配：在缩放后的图像上枚举模板的 angles 和 scales 组合，搜索平移位置并生成候选。",

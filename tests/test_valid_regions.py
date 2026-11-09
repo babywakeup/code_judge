@@ -14,13 +14,32 @@ from tests.helpers import texture
 
 
 class ValidRegionTests(unittest.TestCase):
-    def test_height_overrides_fraction_and_intersects_mask_without_mutation(self):
+    def test_removed_fraction_option_is_rejected_in_flat_and_grouped_options(self):
+        for options in ({'bottom_ignore_fraction': .08},
+                        {'step1': {'bottom_ignore_fraction': .08}}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                MatcherConfig.from_options(options)
+
+    def test_default_region_uses_full_image_and_preserves_rotated_mask(self):
+        from periodic_template_matcher.utils import ValidRegion
+        image = np.zeros((160, 200), np.uint8)
+        region = ValidRegion()
+        self.assertEqual(region.resolved_height(image), 160)
+        self.assertEqual(region.describe(image, region.build_mask(image))['height_source'], 'full_image')
+        original = ValidRegion(valid_height=147).build_mask(image)
+        for k in (-1, 1):
+            rotated_image = np.ascontiguousarray(np.rot90(image, k))
+            rotated_mask = np.ascontiguousarray(np.rot90(original, k))
+            actual = region.build_mask(rotated_image, rotated_mask)
+            np.testing.assert_array_equal(actual, rotated_mask)
+
+    def test_height_intersects_mask_without_mutation(self):
         from periodic_template_matcher.utils import ValidRegion
         image = np.zeros((160, 200, 3), np.uint8)
         mask = np.ones((160, 200), np.uint8)
         mask[:10, :20] = 0
         original = mask.copy()
-        region = ValidRegion(valid_height=150, bottom_ignore_fraction=.2)
+        region = ValidRegion(valid_height=150)
         actual = region.build_mask(image, mask)
         self.assertEqual(actual.dtype, np.uint8)
         self.assertTrue(actual[149, 199])
@@ -28,7 +47,7 @@ class ValidRegionTests(unittest.TestCase):
         self.assertFalse(actual[:10, :20].any())
         np.testing.assert_array_equal(mask, original)
         self.assertEqual(region.crop(image).shape, (150, 200, 3))
-        self.assertEqual(ValidRegion(bottom_ignore_fraction=.1).resolved_height(image), 144)
+        self.assertEqual(ValidRegion(valid_height=144).resolved_height(image), 144)
 
     def test_invalid_heights_fail_clearly(self):
         from periodic_template_matcher.utils import ValidRegion
@@ -44,7 +63,7 @@ class ValidRegionTests(unittest.TestCase):
 
     def test_match_resolves_independent_heights_before_registration(self):
         image = texture()
-        cfg = MatcherConfig(valid_height=140, bottom_ignore_fraction=.2)
+        cfg = MatcherConfig(valid_height=140)
         from periodic_template_matcher.matcher import select_templates as real_select
         with patch('periodic_template_matcher.matcher.select_templates', wraps=real_select) as select:
             result = PeriodicTemplateMatcher(cfg).match(
@@ -53,7 +72,6 @@ class ValidRegionTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertTrue(result.label_valid[140:145, 20:180].all())
         self.assertFalse(result.label_valid[145:].any())
-        self.assertEqual(select.call_args.args[2].bottom_ignore_fraction, 0)
         self.assertIsNone(select.call_args.args[2].valid_height)
         self.assertTrue(select.call_args.args[3][0][149].all())
         self.assertFalse(select.call_args.args[3][0][150:].any())
@@ -108,7 +126,7 @@ class ValidRegionTests(unittest.TestCase):
             write_image(root/'labels.png', np.ones(image.shape[:2], np.uint16))
             spec = dict(target='image.png', target_valid_height=130,
                         templates=[dict(image='image.png', labels='labels.png', valid_height=150)],
-                        options=dict(valid_height=140, bottom_ignore_fraction=.2, max_side=200,
+                        options=dict(valid_height=140, max_side=200,
                                      angles=[0], scales=[1], refine_candidates=2, ecc_iterations=20))
             path = root/'config.json'
             path.write_text(json.dumps(spec), encoding='utf-8')

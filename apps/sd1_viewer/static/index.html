@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SD-1 · 数据集观察器</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<header><div class="brand"><span class="mark">◈</span><div><strong>SD-1 数据集观察器</strong><small>AOI / 图片与标注</small></div></div><div id="stats">正在读取数据集…</div><span class="readonly">● 只读浏览</span></header>
+<main>
+<aside class="library">
+  <div class="section-title">数据目录 <span id="total"></span></div>
+  <label>搜索文件名<input id="search" type="search" placeholder="输入文件名或路径…"></label>
+  <div class="filters"><label>目录<select id="group"><option value="">全部目录</option></select></label><label>配对状态<select id="status"><option value="">全部状态</option><option value="paired">图片 + 标注</option><option value="image_only">缺少标注</option><option value="annotation_only">缺少图片</option><option value="invalid">标注异常</option></select></label></div>
+  <label>缺陷类别<select id="label"><option value="">全部类别</option></select></label>
+  <div id="list" role="list" aria-label="图片列表"></div>
+  <nav class="pagination"><button id="pagePrev" aria-label="上一页">‹</button><span id="pageInfo">—</span><button id="pageNext" aria-label="下一页">›</button></nav>
+</aside>
+<section class="workspace">
+  <div class="image-heading"><div id="filename">选择图片</div><span id="dimensions"></span></div>
+  <div class="toolbar"><button id="prev">← 上一张</button><button id="next">下一张 →</button><span class="divider"></span><button id="fit">适应 F</button><button id="actual">100%</button><button id="zoomOut" aria-label="缩小">−</button><span id="zoom">—</span><button id="zoomIn" aria-label="放大">+</button><label class="check"><input id="boxes" type="checkbox" checked>标注框</label><label class="check"><input id="names" type="checkbox" checked>类别名</label></div>
+  <div id="stage"><canvas id="canvas" aria-label="原图与标注，滚轮缩放，拖动平移"></canvas><div id="empty">正在加载…</div></div>
+  <footer><span id="pointer">滚轮缩放 · 拖动平移 · 点击标注查看局部</span><span>← → 切图 · F 适应 · B 显隐标注</span></footer>
+</section>
+<aside class="inspector">
+  <div class="section-title">标注详情 <span id="objectCount">0</span></div>
+  <div id="notice" hidden></div>
+  <div class="crop-area"><canvas id="crop" aria-label="选中缺陷局部"></canvas><span id="cropEmpty">选择标注查看缺陷局部</span></div>
+  <div id="objectInfo" class="object-info">点击图中矩形框或下方标注</div>
+  <div id="objects"></div>
+  <details><summary>文件信息</summary><div id="paths"></div></details>
+  <details><summary>数据集概览</summary><div id="overview"></div></details>
+</aside>
+</main>
+<script src="/app.js"></script>
+</body></html>

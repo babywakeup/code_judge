@@ -11,7 +11,7 @@ from unittest.mock import patch
 import periodic_template_matcher as package
 from periodic_template_matcher import __main__ as cli
 from periodic_template_matcher import config, matcher
-from periodic_template_matcher._internal import results
+from periodic_template_matcher._internal import models
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,8 +46,8 @@ class PackageTests(unittest.TestCase):
     def test_public_types_are_single_definitions(self):
         self.assertIs(package.MatcherConfig, config.MatcherConfig)
         self.assertIs(package.PeriodicTemplateMatcher, matcher.PeriodicTemplateMatcher)
-        self.assertIs(package.MatchResult, results.MatchResult)
-        self.assertIs(package.EvaluationResult, results.EvaluationResult)
+        self.assertIs(package.MatchResult, models.MatchResult)
+        self.assertIs(package.EvaluationResult, models.EvaluationResult)
         self.assertEqual(set(package.__all__), {'MatcherConfig', 'PeriodicTemplateMatcher',
                             'MatchResult', 'EvaluationResult', 'run_config'})
 
@@ -79,6 +79,30 @@ assert callable(run_config)
                          {'__init__.py', '__main__.py', 'config.py', 'matcher.py'})
         for name in ('periodic_matcher', 'segmentation', 'cli', 'test_matcher', 'test_matcher_api'):
             self.assertIsNone(importlib.util.find_spec(f'periodic_template_matcher.{name}'))
+
+    def test_internal_root_only_contains_orchestration_and_shared_models(self):
+        internal = PACKAGE_DIR / '_internal'
+        self.assertEqual({p.name for p in internal.glob('*.py')},
+                         {'__init__.py', 'pipeline.py', 'models.py'})
+        self.assertEqual({p.name for p in internal.iterdir()
+                          if p.is_dir() and p.name != '__pycache__'},
+                         {'registration', 'objects', 'segmentation', 'io'})
+
+    def test_all_domain_modules_import_in_a_fresh_interpreter(self):
+        code = '''
+import importlib
+import pkgutil
+from periodic_template_matcher import _internal, MatchResult
+from periodic_template_matcher._internal.models import MatchResult as InternalResult
+assert MatchResult is InternalResult
+modules = [item.name for item in pkgutil.walk_packages(_internal.__path__, _internal.__name__ + '.')]
+for name in modules:
+    importlib.import_module(name)
+assert not any('.steps.' in name for name in modules)
+assert all(name.rsplit('.', 1)[-1] not in ('object_axes', 'ordered_objects', 'object_completion')
+           for name in modules)
+'''
+        self.run_python('-c', code)
 
     def test_cli_argument_routing(self):
         result = dict(best_template_index=0, accepted=True, status='accepted',
