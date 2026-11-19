@@ -86,3 +86,82 @@ The adapter contract test checks this flag and pixel inputs.
   Do not repeat the earlier incorrect claim or replace the CPU Torch environment.
 - Remaining runtime prerequisite: enough system memory/commit capacity. No unrelated
   processes were terminated and no pagefile, driver or system settings were changed.
+
+## Continuation on feat/supposed-to-be-good (November 19)
+
+- Confirmed the correct branch and existing Transformers integration. Fixed only the
+  synthetic HF-bundle test fixture: its config.json previously overwrote the business
+  target/box config. Use a separate hf_bundle directory and assert config preservation.
+- Related 61 tests passed in 0.574 s. Full Python regression: **271 passed / 86.020 s**.
+  Editor diagnostics were clean for both adapters/prediction and their tests.
+- NumPy testing's platform.machine() hit an unresponsive Windows WMI query, verified
+  with a timed Python stack dump. Validation runners used process-local
+  platform._wmi_query -> OSError to invoke Python's ordinary Windows fallback.
+  No production workaround or system-service change was made. The normal VS Code
+  inference task stalled without output and its own two Python processes were stopped.
+- Available commit headroom before retry was 7.73 GiB (not the earlier 2–3 GB).
+  Real CLI runs via the same process-local WMI fallback then SUCCESSFULLY loaded and
+  executed both local models on CPU FP32. Model computations were not mocked.
+  Both manifests have model_executed=true, missing_keys=[], mismatched_keys=[].
+  Tracker emitted the sam3_video -> sam3_tracker architecture-subset warning;
+  complete loading and actual prediction nevertheless succeeded.
+- Box image inference: 1 instance, 22,742 predicted pixels, including 271 without
+  reference support. Manifest SHA256:
+  7838086fc833ff2617e1971ba139ab1552c188283b332bfbaafc95fb6d52887f.
+- Guided tracker inference: 16 fixed component tasks, all status ok; seed component
+  truncation retained and reported. Union: 182,715 pixels, 679 without reference.
+  Manifest SHA256:
+  4c629106abc677658578be5bfd91b47de002ecbb7d74c887d255959b3c067258.
+
+### Independent evaluation after both predictions were frozen
+
+Both manifest hashes were recorded BEFORE GT access. The existing independent
+evaluator verified all artifact hashes before reading GT and created new separate
+sam3_box_transformers_evaluation / sam3_anomaly_points_transformers_evaluation
+directories. Manifest hashes were checked unchanged afterwards. External decoded
+original image equality passed; embedded-copy-differs warning is retained. Full-image
+GT coverage is 100%. No prompt, threshold, candidate or output mask was changed.
+
+| Method | TP | FP | FN | Precision | Recall | IoU | Dice |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Historical GraphCut | 21,783 | 14,757 | 23,276 | 59.61% | 48.34% | 36.42% | 53.39% |
+| SAM3 image box | 4,022 | 18,720 | 41,037 | 17.69% | 8.93% | 6.31% | 11.86% |
+| SAM3 tracker box + anomaly points | 44,675 | 138,040 | 384 | 24.45% | 99.15% | 24.40% | 39.23% |
+
+The current SAM3 integration runs correctly but does NOT improve the baseline on
+this known development image. Guided prompts achieve high recall at substantial
+over-segmentation. Image and tracker modes differ in model interface as well as
+prompts, so this is not a controlled ablation proving normal reference is necessary
+or redundant. Do not tune against these GT results; any new prompt policy requires
+fixed rules and separate validation data. No claim of unseen-test performance or
+measured inference latency is made.
+
+## User-requested larger image context (November 19)
+
+- Add --context-fraction (API context_fraction) with default 0.1 unchanged. This
+  scales padding PER SIDE by original detector width/height, with the existing
+  16px minimum and image-boundary clipping. Original detector prompts are only
+  translated to crop coordinates, never enlarged. Record the actual fraction in
+  the frozen manifest. Finite nonnegative values only; very large values saturate
+  at image boundaries without multiplication overflow.
+- Tests cover expanded crops in both modes, original box/point preservation,
+  edge clipping, invalid fractions, RGB input and full-image output mapping,
+  no output clipping back to prompt/validity, and CLI parameter forwarding.
+  Related **66 passed / 0.591 s**; full **276 passed / 83.399 s**. Editor diagnostics
+  clean. Existing production calls compatible; prompt-test signature warnings
+  concern deliberate malformed validation inputs and heterogeneous test dictionaries.
+- Execute ONE real local Sam3Model CPU FP32 box-only prediction with fixed
+  context_fraction=0.5 (not a GT-driven sweep). No text/points, same 0.5 confidence
+  and mask thresholds. Use the existing process-local Windows WMI fallback only.
+- Original detection [1092,336,1606,803] unchanged. ROI becomes
+  [835,102,1863,1037], 1028x935 instead of 618x561. Local prompt is
+  [257,234,771,701]. Complete weights load: missing_keys=[], mismatched_keys=[].
+- New-only anomaly/sam3_box_transformers_context50/prediction.json; SHA256
+  39cf9d2f45221ad794762fd381784d58b5d0b33631bb38f96e6c690280b9bb6e.
+  model_executed=true, status=ok. Union all 4 threshold-filtered instances:
+  119,937 pixels, 132 without reference support; touches_roi warning retained.
+  Overlay visibly includes repeated structures outside the detection as well.
+  Do not claim improved accuracy from increased area or visual inspection.
+- Both previous prediction manifest hashes verified unchanged. No new GT read or
+  evaluation in this user-requested run. This remains a known development image,
+  not a new held-out experiment; no candidate selection or threshold tuning.

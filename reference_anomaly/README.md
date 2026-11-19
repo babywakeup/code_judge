@@ -266,9 +266,9 @@ SAM 看的是**原图 RGB 裁剪**，异常图只生成点提示，不作为输�
 也可在 VS Code 中运行任务 **SAM3: local Transformers CPU inference**。
 显式设为 `--device auto` 即按设备可用性选择；无须更换现有 CPU Torch。
 
-### 两条固定对照路径
+### 提示与对照模式
 
-两种模式都需要 `--result` 指向已保存结果，并通过 `--config` 只提取 target / box；
+各模式都需要 `--result` 指向已保存结果，并通过 `--config` 只提取 target / box；
 也支持直接传 `--target` / `--boxes`。沿用显式 XML 坐标约定
 `--xml-coordinates voc_1based_inclusive` 或 `zero_half_open`。
 
@@ -276,12 +276,18 @@ SAM 看的是**原图 RGB 裁剪**，异常图只生成点提示，不作为输�
 |---|---|
 | `--mode box` | 每个检测框一个框提示，不读取异常分数和 confidence；参考 valid 仅用于覆盖记录 |
 | `--mode anomaly_points` | 默认：框＋异常正负点，每个高响应组件独立提示，再 union 结果 |
+| `--mode tracker_box` | 使用 Sam3TrackerModel 的纯框对照，不读取异常分数和 confidence |
+| `--mode anomaly_guided` | 同一 Tracker 模型，联合异常核心正点、框内外近邻正常负点，再按参考证据筛选候选；详见下节 |
+| `--context-fraction` | 裁剪框每侧相对原检测框宽/高的扩展比例，默认 0.1；例如 0.5 为每侧 50%，提示框保持原检测框 |
 | `--text` | 可选文本，只能与 Transformers 的 box 模式结合；不由 GT 生成 |
 | `--threshold` / `--mask-threshold` | Transformers 图像模式实例置信度/像素阈值，均默认 0.5；不能用当前 GT 调参 |
 | `--prepare-only` | 只保存可检查的提示与输入，不构造模型，不输出 prediction mask |
 | `--out` | 可选新输出目录，已有目录/源文件禁止覆盖 |
 
-固定提示规则：检测框上下文每侧 10%、至少 16px；框内 valid 且 confidence=255、
+默认裁剪上下文每侧 10%、至少 16px，并截断到原图边界。`--context-fraction` 只扩大
+模型看到的原图区域，不扩大检测框提示；提示坐标仅减去裁剪左上角。扩大上下文的重跑必须
+以 `--out` 指定新目录，不能覆盖默认目录中的冻结结果。比例须为有限非负数，0 仍保留 16px
+最小上下文。旧 `anomaly_points` 规则保持不变：框内 valid 且 confidence=255、
 salience_score ≥3 的高响应组件按峰值排序最多取 16 个，每个最多 3 个分散内部正点。
 负点来自**所有检测框外**、可靠且 salience_score ≤1 的区域，最多 8 个分散内部点。
 参考未知位置不生成正负点，框内低热度位置不直接当负点。多个组件分开提示，
@@ -326,12 +332,88 @@ checkpoint、HF 配置/tokenizer、输入/响应的来源哈希及适配器代�
 先保存预测，之后才可用已有独立评价入口 `reference_anomaly.box_evaluation` 读取 GT；
 `GT_labelme` 不作为 SAM 模块参数，预测阶段不解析其路径。
 
-**2026-11-19 真实 CPU 运行状态：**已执行上述本地 Transformers CPU 命令，模型加载失败于
+**2026-11-19 首次 CPU 尝试（历史）：**已执行上述本地 Transformers CPU 命令，模型加载失败于
 Windows **页面文件/虚拟内存提交限制（1455）**，当时提交余量仅约 2–3 GB。
 这不是“不支持 CPU”或“必须安装 CUDA”。需要释放足够内存提交量或调整系统虚拟内存后重试；
 程序没有擅自终止其他进程、修改页面文件、驱动或 Torch 安装。
-尚未产出真实 SAM3 prediction manifest，**两种真实模型的完整加载、推理与效果仍未验证**，
-没有用 GT 选择参数或报告 SAM3 准确率。
+
+**2026-11-19 分支切换后续跑：两条真实 CPU 推理均成功。**在
+`feat/supposed-to-be-good` 上，以原有固定提示/阈值加载本地权重，Sam3Model 和
+Sam3TrackerModel 均完成加载、CPU FP32 推理和冻结导出，missing/mismatched keys 均为空。
+本机另有 Windows WMI 查询阻塞；回归运行器及此次真实推理启动包装仅在各自进程内让
+`platform._wmi_query` 抛出 OSError，触发 Python 标准 Windows 回退。不模拟模型、张量、
+候选或分数，不修改生产模块或系统服务。普通 VS Code 任务不包含此临时包装。
+首次无输出的推理任务已停止，未终止无关进程。
+
+两份 prediction manifest 在读取 GT **之前**均已生成并记录 SHA256；独立评价器随后
+校验全部冻结 artifact 哈希、验证外部原图像素身份，并新建独立评价目录。结果如下：
+
+| 固定路径 | 预测像素 | Precision | Recall | IoU | Dice |
+|---|---:|---:|---:|---:|---:|
+| GraphCut（已有基线） | 36,540 | 59.61% | 48.34% | 36.42% | 53.39% |
+| SAM3 框提示 | 22,742 | 17.69% | 8.93% | 6.31% | 11.86% |
+| SAM3 框＋异常点（16 组） | 182,715 | 24.45% | 99.15% | 24.40% | 39.23% |
+
+SAM3 框提示结果和评价分别位于 anomaly/sam3_box_transformers、
+anomaly/sam3_box_transformers_evaluation；异常点结果分别位于
+anomaly/sam3_anomaly_points_transformers、anomaly/sam3_anomaly_points_transformers_evaluation。
+框提示仍漏掉大部分 GT；异常点方案扩大到正常纹理，误分严重。**当前 SAM3 方案并未超过
+GraphCut**。框＋异常点还同时更换了 image/tracker 模型接口，因此这不是隔离异常提示作用的
+严格消融，不能据此断言正常参考可删除或必然改善分割。当前图是已见开发样本，不能代表
+未见测试集；没有据此重选提示、阈值或候选，也没有裁剪/后处理冻结结果。
 
 合成测试覆盖提示规划、离线 CPU 参数、两类 HF 模型接口、embedding 缓存、图像多实例并集、
-交互候选选择、GT 隔离及冻结契约。单测不导入 Torch 或加载权重，不能替代真实推理验证。
+交互候选选择、GT 隔离及冻结契约；这些合成测试不加载权重，不能替代上述真实推理。
+修复 HF 模拟配置覆盖业务配置的测试夹具后，相关 61 项测试通过；完整 Python 回归
+**271 项通过，86.020 秒**（仅运行器使用上述 WMI 回退）。
+
+**2026-11-19 按用户要求扩大裁剪：**固定使用 `--mode box --context-fraction 0.5`，
+其余模型和阈值不变，没有异常点或自定义文本。裁剪从 618×561 扩为 **1028×935**，
+原图 ROI 为 `[835,102,1863,1037]`。检测框仍是 `[1092,336,1606,803]`，传入处理器的
+crop-local 提示仅平移为 `[257,234,771,701]`，不是把 ROI 当成提示框。
+真实 CPU 推理另存 anomaly/sam3_box_transformers_context50，4 个通过原阈值的实例
+合并为 119,937 像素，132 像素无参考覆盖，有 touches_roi 提示。从叠加图可见也选中了
+框外重复结构；框提示不是输出边界限制，不能直接断言扩大裁剪后更准确。本轮没有再次读取
+GT 或计算指标，两份历史预测 manifest 哈希保持不变。
+相关测试 **66 项通过 / 0.591 秒**，完整回归 **276 项通过 / 83.399 秒**。
+
+### 新增异常辅助 Tracker 策略（2026-11-19）
+
+`--mode anomaly_guided` 与 `--mode tracker_box` 都使用 Sam3TrackerModel /
+Sam3TrackerProcessor。原图 RGB、原始检测框、裁剪比例、模型权重和模型后处理均相同；
+差异是异常点提示和候选证据筛选。旧 box/image 与 anomaly_points 路径和冻结结果不变。
+
+辅助规则在真实推理前固定，完整记录见
+[实验计划](../docs/superpowers/plans/2026-11-19-sam3-anomaly-guidance.md)：
+
+- 仅 confidence=255 的参考可提供证据。分数 ≥3 的组件内部核心产生正点，最多
+    16 个组件、每个最多 3 点，**合成一次联合提示**，不再独立分割后并集。
+- 分数 ≤1 的可靠区域可以产生正常负点；距任意可靠高响应区域至少 3px，并限制在
+    max(8px, ceil(原检测框短边×0.1)) 邻域。框内最多 8 点，所有检测框外最多 8 点。
+    confidence=0/128、分数中间区域不作负点。两组负点池都缺失时 abstain。
+- 候选必须满足全部点，覆盖至少 50% 的所选核心；在核心与可靠正常证据域内，正常占比
+    不超过 50%。按“核心覆盖率－正常占比”排序，再按模型质量与稳定索引打破平局。
+    未知区域中立；证据分不是 GT IoU。全部不合格就拒绝输出，不回退到质量最高的错误候选。
+- **不裁切、不平滑模型掩膜**。冻结导出额外包含 guidance_evidence.npz、完整策略常量、
+    证据代码哈希及每个候选的覆盖率、正常占比和拒绝原因。
+
+本次真实同模型对照使用 `--context-fraction 0.5`、CPU FP32、无文本。原保存结果的
+input.png 和 result.json 已变化，首次执行被原图一致性检查拒绝，未绕过或关闭检查。
+从历史冻结输入副本及哈希仍匹配的异常分数/置信度/valid 建立
+results/sd1_sam3_guidance_replay 独立重放快照，明确标记为历史证据重放而非新 matcher
+运行；原始目标图与冻结输入的像素相等，来源与哈希链已记录。现有 matcher 文件未覆盖。
+两组真实预测均使用这一份已校验快照，输出另存于原 anomaly 目录：
+
+| 路径 | 真实推理 | 输出 |
+|---|---|---|
+| sam3_tracker_box_transformers_context50 | 成功，3 个备选 | 按模型质量选第 3 个，104,838 像素 |
+| sam3_anomaly_guided_transformers_context50 | 成功，48 正点＋16 负点，3 个备选 | 全部拒绝，status=abstained，输出空掩膜 |
+
+辅助候选分别漏掉 42、11、19 个正点；后两个还覆盖了 1 个负点。证据域内正常占比约
+96.45%、98.86%、99.01%，全部超过预设门槛。**这是未取得可信分割，不是判定图中无缺陷**。
+原始候选全部保留；另有 sam3_anomaly_guided_context50_diagnostics/rejected_candidates.png
+诊断图，不属于最终预测。没有据此放宽门槛、重选点、修改掩膜或读取 GT 计算新指标。
+同模型/权重/输入/裁剪/原框及全部冻结 artifact 哈希已校验，历史三份 manifest 未变。
+
+相关 **82 项测试通过 / 0.758 秒**；完整 Python 回归 **292 项通过 / 89.403 秒**。
+真实模型和回归继续仅使用进程级 WMI 回退，不修改模型计算、Torch 或系统服务。

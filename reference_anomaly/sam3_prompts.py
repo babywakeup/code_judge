@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from .box_graphcut import DetectionBox
+from .sam3_guidance import GUIDANCE_CONFIG, guidance_evidence
 
 
 # Fixed algorithm choices, suitable for copying into prediction provenance.
@@ -88,7 +89,8 @@ def _evidence(image_shape, score, valid, confidence):
 def plan_prompts(image_shape: tuple[int, int], boxes: list[DetectionBox], *,
                  mode='anomaly_points', score: np.ndarray | None = None,
                  valid: np.ndarray | None = None,
-                 confidence: np.ndarray | None = None) -> list[dict]:
+                 confidence: np.ndarray | None = None,
+                 context_fraction: float = CONFIG['context_fraction']) -> list[dict]:
     """Return one record per detector box, with one task per selected component.
 
     All task coordinates are local to the clipped padded ROI. Positive points
@@ -96,6 +98,8 @@ def plan_prompts(image_shape: tuple[int, int], boxes: list[DetectionBox], *,
     labels within that detection's crop, not IDs shared between detections.
     Missing reference/foreground/background pixels explicitly abstain; invalid
     arguments raise ValueError, including for empty/out-of-frame detections.
+    context_fraction expands each crop side by that fraction of the ORIGINAL
+    box width/height (at least min_context pixels), never the prompt box itself.
     """
     if (not isinstance(image_shape, tuple) or len(image_shape) != 2
             or any(type(n) is not int or n <= 0 for n in image_shape)):
@@ -106,15 +110,18 @@ def plan_prompts(image_shape: tuple[int, int], boxes: list[DetectionBox], *,
         if not isinstance(box, DetectionBox):
             raise ValueError('boxes must contain DetectionBox instances')
         box.validate()
-    if mode not in ('box', 'anomaly_points'):
-        raise ValueError('mode must be box or anomaly_points')
+    if mode not in ('box', 'tracker_box', 'anomaly_points', 'anomaly_guided'):
+        raise ValueError('mode must be box, tracker_box, anomaly_points or anomaly_guided')
+    if (isinstance(context_fraction, bool) or not isinstance(context_fraction, (int, float))
+            or not math.isfinite(context_fraction) or context_fraction < 0):
+        raise ValueError('context_fraction must be a finite nonnegative number')
     reliable = None
-    if mode == 'anomaly_points':
+    if mode in ('anomaly_points', 'anomaly_guided'):
         reliable = _evidence(image_shape, score, valid, confidence)
 
     height, width = image_shape
     detection_union = None
-    if mode == 'anomaly_points':
+    if mode in ('anomaly_points', 'anomaly_guided'):
         detection_union = np.zeros(image_shape, bool)
         for box in boxes:
             detection_union[max(0, box.y0):max(0, min(height, box.y1)),
@@ -129,13 +136,17 @@ def plan_prompts(image_shape: tuple[int, int], boxes: list[DetectionBox], *,
         bx1, by1 = min(width, box.x1), min(height, box.y1)
         if bx0 >= bx1 or by0 >= by1:
             continue
-        dx = max(CONFIG['min_context'], math.ceil((box.x1 - box.x0) * CONFIG['context_fraction']))
-        dy = max(CONFIG['min_context'], math.ceil((box.y1 - box.y0) * CONFIG['context_fraction']))
+        # Clip padding before multiplication: even huge finite fractions should
+        # saturate at the image boundary rather than overflow to infinity.
+        dx = max(CONFIG['min_context'], math.ceil(
+            (box.x1 - box.x0) * min(context_fraction, width / (box.x1 - box.x0))))
+        dy = max(CONFIG['min_context'], math.ceil(
+            (box.y1 - box.y0) * min(context_fraction, height / (box.y1 - box.y0))))
         x0, y0 = max(0, box.x0 - dx), max(0, box.y0 - dy)
         x1, y1 = min(width, box.x1 + dx), min(height, box.y1 + dy)
         record['roi_xyxy'] = [x0, y0, x1, y1]
         local_box = [bx0 - x0, by0 - y0, bx1 - x0, by1 - y0]
-        if mode == 'box':
+        if mode in ('box', 'tracker_box'):
             record.update(status='ok', prompts=[dict(
                 box_xyxy=local_box, points_xy=[], point_labels=[], component_id=None)])
             continue
@@ -149,6 +160,34 @@ def plan_prompts(image_shape: tuple[int, int], boxes: list[DetectionBox], *,
         inside[ly0:ly1, lx0:lx1] = True
         if not np.any(trusted & inside):
             record['status'] = 'no_reliable_reference'
+            continue
+        if mode == 'anomaly_guided':
+            evidence = guidance_evidence(response, trusted, inside)
+            if not evidence.component_ids:
+                record['status'] = 'no_foreground_seeds'
+                continue
+            if evidence.component_count > len(evidence.component_ids):
+                record['warnings'].append('seed_components_truncated')
+            inside_negatives = _spread(evidence.near_normal & inside,
+                                       GUIDANCE_CONFIG['inside_negative_points'])
+            outside_negatives = _spread(evidence.near_normal & ~detection_union[roi],
+                                        GUIDANCE_CONFIG['outside_negative_points'])
+            if not inside_negatives:
+                record['warnings'].append('no_near_normal_inside_box')
+            if not outside_negatives:
+                record['warnings'].append('no_near_normal_outside_boxes')
+            negatives = inside_negatives + outside_negatives
+            if not negatives:
+                record['status'] = 'no_background_seeds'
+                continue
+            positives = [p for group in evidence.component_ids for p in _spread(
+                evidence.core & (evidence.components == group),
+                GUIDANCE_CONFIG['positive_points_per_component'])]
+            record.update(status='ok', prompts=[dict(
+                box_xyxy=local_box, points_xy=positives + negatives,
+                point_labels=[1] * len(positives) + [0] * len(negatives),
+                component_id=None, component_ids=evidence.component_ids,
+                inside_negative_count=len(inside_negatives), outside_negative_count=len(outside_negatives))])
             continue
         count, components = cv2.connectedComponents(
             (inside & trusted & (response >= CONFIG['foreground_threshold'])).astype(np.uint8),

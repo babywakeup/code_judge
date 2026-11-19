@@ -15,6 +15,7 @@ from .box_graphcut import _bgr, read_boxes
 from .box_prediction import _artifact, _document, _read, _selected_paths, _sha, _write
 from .sam3_backend import OfficialSam3Backend, choose_backend, environment_report, resolve_checkpoint
 from .sam3_prompts import CONFIG, plan_prompts
+from .sam3_guidance import GUIDANCE_CONFIG, choose_guided_candidate, guidance_evidence
 from .sam3_transformers import TransformersSam3Backend, bundle_sources, resolve_transformers_checkpoint
 
 
@@ -60,7 +61,7 @@ def _sources(result_path, config_path, target_path, boxes_path, mode):
     if not isinstance(origin, str) or Path(origin).resolve() != manifest:
         raise ValueError('Anomaly evidence does not belong to this matcher result')
     paths.update(anomaly_manifest=anomaly, valid=_artifact(anomaly, evidence, 'valid'))
-    if mode == 'anomaly_points':
+    if mode in ('anomaly_points', 'anomaly_guided'):
         paths.update(scores=_artifact(anomaly, evidence, 'scores'),
                      confidence=_artifact(anomaly, evidence, 'confidence'))
     return paths, anomaly.parent
@@ -72,14 +73,15 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
                    mode: str = 'anomaly_points', prepare_only: bool = False, device: str = 'auto',
                    coordinates: str = 'voc_1based_inclusive', backend=None,
                    backend_type: str = 'auto', text: str | None = None,
-                   threshold: float = .5, mask_threshold: float = .5) -> Path:
+                   threshold: float = .5, mask_threshold: float = .5,
+                   context_fraction: float = CONFIG['context_fraction']) -> Path:
     """Freeze prompts or predictions to a new directory, without any GT argument.
 
     An injected backend supports synthetic contract tests, not surrogate model
     claims. Actual runs always record backend identity and checkpoint hashes.
     """
-    if mode not in ('box', 'anomaly_points'):
-        raise ValueError('mode must be box or anomaly_points')
+    if mode not in ('box', 'tracker_box', 'anomaly_points', 'anomaly_guided'):
+        raise ValueError('mode must be box, tracker_box, anomaly_points or anomaly_guided')
     if device not in ('auto', 'cpu', 'cuda'):
         raise ValueError('device must be auto, cpu or cuda')
     if any(not np.isfinite(v) or not 0 <= v <= 1 for v in (threshold, mask_threshold)):
@@ -116,14 +118,15 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
             or not np.isin(raw_valid, [0, 255]).all()):
         raise ValueError('Comparison validity must be input-sized uint8 0/255')
     valid, response, confidence = raw_valid != 0, None, None
-    if mode == 'anomaly_points':
+    if mode in ('anomaly_points', 'anomaly_guided'):
         confidence = _read(paths['confidence'])
         with np.load(paths['scores'], allow_pickle=False) as scores:
             if 'salience_score' not in scores:
                 raise ValueError('Missing salience_score; regenerate anomaly evidence')
             response = scores['salience_score']
     boxes = read_boxes(paths['boxes'], image.shape[:2], coordinates=coordinates)
-    plan = plan_prompts(image.shape[:2], boxes, mode=mode, score=response, valid=valid, confidence=confidence)
+    plan = plan_prompts(image.shape[:2], boxes, mode=mode, score=response, valid=valid,
+                        confidence=confidence, context_fraction=context_fraction)
     if not prepare_only and backend is None and any(r['status'] == 'ok' for r in plan):
         if selected_backend == 'transformers':
             backend = TransformersSam3Backend(model_dir, device=device,
@@ -135,6 +138,7 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
     seeds = np.zeros_like(image)
     mask = np.zeros(image.shape[:2], bool)
     raw_candidates = {}
+    raw_guidance = {}
     model_executed = False
     for record in plan:
         if record['status'] != 'ok':
@@ -142,6 +146,16 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
         x0, y0, x1, y1 = record['roi_xyxy']
         cv2.rectangle(preview, (x0, y0), (x1-1, y1-1), (255, 160, 0), 1)
         crop = image[y0:y1, x0:x1]
+        evidence = None
+        if mode == 'anomaly_guided':
+            assert response is not None and confidence is not None
+            inside = np.zeros(crop.shape[:2], bool)
+            bx0, by0, bx1, by1 = record['prompts'][0]['box_xyxy']
+            inside[by0:by1, bx0:bx1] = True
+            reliable = valid[y0:y1, x0:x1] & (confidence[y0:y1, x0:x1] == GUIDANCE_CONFIG['reliable_confidence'])
+            evidence = guidance_evidence(response[y0:y1, x0:x1], reliable, inside)
+            raw_guidance[f'box_{record["index"]}_core'] = evidence.core
+            raw_guidance[f'box_{record["index"]}_normal'] = evidence.normal
         if not prepare_only:
             backend.set_image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
             model_executed = True
@@ -159,7 +173,12 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
                                              point_labels=task['point_labels'])
             selected_mask, selected, candidates = select_candidate(
                 masks, quality, crop.shape[:2], task['points_xy'], task['point_labels'])
-            if getattr(backend, 'candidate_semantics', 'alternatives') == 'instances':
+            if mode == 'anomaly_guided':
+                if getattr(backend, 'candidate_semantics', 'alternatives') != 'alternatives':
+                    raise ValueError('anomaly_guided requires interactive alternative masks, not image instances')
+                assert evidence is not None
+                selected_mask, selected, candidates = choose_guided_candidate(masks, quality, candidates, evidence)
+            elif getattr(backend, 'candidate_semantics', 'alternatives') == 'instances':
                 # Sam3Model outputs distinct instances, not competing hypotheses.
                 # Retain ALL nonempty instances already confidence-filtered by HF.
                 selected = [c['index'] for c in candidates if c['nonempty'] and c['prompt_consistent']]
@@ -168,7 +187,8 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
             raw_candidates[key] = np.asarray(masks, np.uint8)
             task.update(selected_candidate=selected, candidates=candidates, candidate_archive_key=key)
             if selected_mask is None:
-                task['status'] = 'no_prompt_consistent_candidate'
+                task['status'] = ('no_evidence_consistent_candidate' if mode == 'anomaly_guided'
+                                  else 'no_prompt_consistent_candidate')
                 continue
             task['status'] = 'ok'
             ok_tasks += 1
@@ -186,20 +206,27 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
     status = ('ok' if good == len(plan) else 'partial') if good else ('no_boxes' if not plan else 'abstained')
     document = dict(format_version=1, kind='sam3_prompt_preparation' if prepare_only else 'sam3_prediction',
                     image_shape=list(image.shape[:2]), status=status, boxes=plan, source=source,
-                    config=dict(CONFIG, mode=mode, xml_coordinates=coordinates,
+                    config=dict(CONFIG, context_fraction=context_fraction,
+                                mode=mode, xml_coordinates=coordinates,
                                 backend=selected_backend, text=text, confidence_threshold=threshold,
                                 mask_threshold=mask_threshold,
-                                selection=('all_instances_above_model_threshold' if selected_backend == 'transformers' and mode == 'box'
+                                selection=('point_and_evidence_gates_then_evidence_score_then_sam_quality' if mode == 'anomaly_guided'
+                                           else 'all_instances_above_model_threshold' if selected_backend == 'transformers' and mode == 'box'
                                            else 'all_prompt_consistent_then_max_sam_quality'),
                                 reference_validity_role='guidance_and_coverage_only_not_output_clipping'),
                     prediction_uses_gt=False, model_executed=model_executed,
                     algorithm_sha256=_sha(Path(__file__)),
                     planner_sha256=_sha(Path(__file__).with_name('sam3_prompts.py')),
                     adapter_sha256=_sha(Path(__file__).with_name('sam3_backend.py')))
+    if mode == 'anomaly_guided':
+        document['config']['guidance'] = dict(GUIDANCE_CONFIG)
+        document['guidance_sha256'] = _sha(Path(__file__).with_name('sam3_guidance.py'))
     if selected_backend == 'transformers':
         document['transformers_adapter_sha256'] = _sha(Path(__file__).with_name('sam3_transformers.py'))
     artifacts = dict(input='input.png', valid='comparison_valid.png', prompts='prompts.json',
                      seeds='seeds.png', preview='prompt_preview.png')
+    if mode == 'anomaly_guided':
+        artifacts['guidance'] = 'guidance_evidence.npz'
     if not prepare_only:
         document.update(predicted_pixels=int(mask.sum()),
                         predicted_without_reference_pixels=int((mask & ~valid).sum()),
@@ -211,6 +238,8 @@ def run_prediction(result_path: str | Path, *, checkpoint: str | Path = 'weights
         _write(output / artifacts[key], array)
     with (output / artifacts['prompts']).open('x', encoding='utf-8') as stream:
         json.dump(plan, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    if mode == 'anomaly_guided':
+        np.savez_compressed(output / artifacts['guidance'], **raw_guidance)
     if not prepare_only:
         _write(output / artifacts['mask'], mask.astype(np.uint8)*255)
         contours, hierarchy = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -238,12 +267,15 @@ def main(argv=None):
     parser.add_argument('--boxes', type=Path)
     parser.add_argument('--checkpoint', type=Path, default=Path('weights/sam3.pt'))
     parser.add_argument('--out', type=Path)
-    parser.add_argument('--mode', choices=['box', 'anomaly_points'], default='anomaly_points')
+    parser.add_argument('--mode', choices=['box', 'tracker_box', 'anomaly_points', 'anomaly_guided'], default='anomaly_points')
     parser.add_argument('--backend', choices=['auto', 'transformers', 'official'], default='auto')
     parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
     parser.add_argument('--text', help='Optional text combined with detector boxes (Transformers box mode)')
     parser.add_argument('--threshold', type=float, default=.5, help='Transformers image instance confidence threshold')
     parser.add_argument('--mask-threshold', type=float, default=.5, help='Transformers image mask threshold')
+    parser.add_argument('--context-fraction', type=float, default=CONFIG['context_fraction'],
+                        help='Crop padding per side as a fraction of original box width/height; '
+                             'minimum 16px, clipped to image. Prompt box is unchanged (default: 0.1)')
     parser.add_argument('--xml-coordinates', choices=['voc_1based_inclusive', 'zero_half_open'], default='voc_1based_inclusive')
     parser.add_argument('--prepare-only', action='store_true', help='Save prompt preview, not a model prediction')
     parser.add_argument('--check', action='store_true', help='Report local checkpoint and runtime readiness')
@@ -258,7 +290,8 @@ def main(argv=None):
                                target_path=args.target, boxes_path=args.boxes, output_dir=args.out,
                                mode=args.mode, prepare_only=args.prepare_only, device=args.device,
                                coordinates=args.xml_coordinates, backend_type=args.backend,
-                               text=args.text, threshold=args.threshold, mask_threshold=args.mask_threshold)
+                               text=args.text, threshold=args.threshold, mask_threshold=args.mask_threshold,
+                               context_fraction=args.context_fraction)
     except (OSError, ValueError, RuntimeError, cv2.error) as error:
         if getattr(error, 'winerror', None) == 1455 or '1455' in str(error):
             parser.exit(2, 'SAM3 CPU/local model loading failed: Windows memory/pagefile commit limit (1455). '

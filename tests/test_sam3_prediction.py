@@ -13,7 +13,7 @@ import numpy as np
 from reference_anomaly.box_prediction import _write, _sha
 from reference_anomaly.box_evaluation import _frozen_prediction
 from reference_anomaly.sam3_backend import OfficialSam3Backend, resolve_checkpoint
-from reference_anomaly.sam3_prediction import run_prediction, select_candidate
+from reference_anomaly.sam3_prediction import main, run_prediction, select_candidate
 
 
 class SyntheticBackend:
@@ -121,20 +121,62 @@ class Sam3PredictionTests(unittest.TestCase):
                 second[0, 0] = True
                 return np.stack((first, second)), np.array([.99, .6])
 
+        # Model config.json and the business config.json are independent files.
+        # Sharing their directory overwrote target/box and broke JSON parsing.
+        model_dir = self.root / 'hf_bundle'
+        model_dir.mkdir()
+        original_config = self.config.read_bytes()
         for name in ('model.safetensors', 'config.json', 'processor_config.json', 'tokenizer.json'):
-            (self.root / name).write_bytes(b'synthetic HF bundle, never loaded')
+            (model_dir / name).write_bytes(b'synthetic HF bundle, never loaded')
         with patch('reference_anomaly.sam3_prediction.OfficialSam3Backend',
                    side_effect=AssertionError('official package should not be needed')):
-            path = self.run_prediction(mode='box', backend=InstancesBackend())
+            path = run_prediction(self.result, checkpoint=model_dir / 'sam3.pt',
+                                  config_path=self.config, mode='box', backend=InstancesBackend())
         doc = json.loads(path.read_text())
         self.assertEqual(doc['config']['backend'], 'transformers')
         self.assertEqual(doc['boxes'][0]['prompts'][0]['selected_candidate'], [0, 1])
         self.assertEqual(doc['predicted_pixels'], 226)  # Both disjoint instances, not best-only.
         self.assertTrue(doc['model_executed'])
-        self.assertEqual(doc['source']['checkpoint']['sha256'], _sha(self.root / 'model.safetensors'))
+        self.assertEqual(doc['source']['checkpoint']['sha256'], _sha(model_dir / 'model.safetensors'))
         self.assertIn('hf_tokenizer_json', doc['source'])
+        self.assertEqual(self.config.read_bytes(), original_config)
         self.assertEqual(doc['transformers_adapter_sha256'], _sha(
             Path(__file__).resolve().parents[1] / 'reference_anomaly' / 'sam3_transformers.py'))
+
+    def test_expanded_crop_backend_receives_original_box_and_export_maps_to_original(self):
+        class RecordingBackend(SyntheticBackend):
+            def predict(self, **kwargs):
+                self.prompt = kwargs
+                # Deliberately cover the whole crop: output must not be clipped
+                # back to the original detector prompt or reference validity.
+                return np.ones((1, *self.rgb.shape[:2]), bool), np.array([.9])
+
+        backend = RecordingBackend()
+        path = self.run_prediction(mode='box', backend=backend, context_fraction=.5)
+        doc = json.loads(path.read_text())
+        self.assertEqual(doc['config']['context_fraction'], .5)
+        record = doc['boxes'][0]
+        self.assertEqual(record['box_xyxy'], [19, 19, 65, 60])
+        self.assertEqual(record['roi_xyxy'], [0, 0, 88, 80])
+        self.assertEqual(backend.prompt['box_xyxy'], [19, 19, 65, 60])
+        self.assertEqual(backend.prompt['points_xy'], [])
+        self.assertEqual(backend.rgb.shape, (80, 88, 3))
+        np.testing.assert_array_equal(backend.rgb, self.image[:, :88, ::-1])
+        _, _, _, _, masks, _ = _frozen_prediction(path)
+        self.assertTrue(masks[0][:, :88].all())
+        self.assertFalse(masks[0][:, 88:].any())
+        self.assertEqual(doc['predicted_pixels'], 80 * 88)
+        self.assertEqual(doc['predicted_without_reference_pixels'], 4)
+
+    def test_cli_forwards_context_fraction_without_changing_model_options(self):
+        with patch('reference_anomaly.sam3_prediction.run_prediction', return_value=Path('frozen.json')) as run:
+            with patch('builtins.print'):
+                self.assertEqual(main(['--result', str(self.result), '--mode', 'box',
+                                       '--context-fraction', '0.5', '--out', str(self.root / 'larger')]), 0)
+        self.assertEqual(run.call_args.kwargs['context_fraction'], .5)
+        self.assertEqual(run.call_args.kwargs['mode'], 'box')
+        self.assertEqual(run.call_args.kwargs['threshold'], .5)
+        self.assertEqual(run.call_args.kwargs['output_dir'], self.root / 'larger')
 
     def test_abstention_does_not_claim_model_execution(self):
         (self.anomaly / 'valid.png').unlink()
@@ -149,9 +191,104 @@ class Sam3PredictionTests(unittest.TestCase):
         self.assertFalse(doc['model_executed'])
         self.assertEqual(doc['predicted_pixels'], 0)
 
+    def test_guided_joint_prompts_select_evidence_not_bloated_high_quality_mask(self):
+        class GuidedBackend(SyntheticBackend):
+            def predict(self, *, box_xyxy, points_xy, point_labels):
+                self.last_points = points_xy
+                tight = self.rgb[..., 0] > 200
+                bloated = np.ones_like(tight)
+                for (x, y), label in zip(points_xy, point_labels):
+                    bloated[y, x] = bool(label)  # Satisfy points but swallow normal elsewhere.
+                self.raw = np.stack((tight, bloated))
+                return self.raw, np.array([.6, .99])
+
+        original_open = Path.open
+        def guarded(path, *args, **kwargs):
+            if path.name == 'never_open_gt.json':
+                self.fail('Guided inference accessed GT')
+            return original_open(path, *args, **kwargs)
+        backend = GuidedBackend()
+        with patch.object(Path, 'open', guarded):
+            path = self.run_prediction(mode='anomaly_guided', backend=backend, context_fraction=.5)
+        doc = json.loads(path.read_text())
+        self.assertEqual(doc['status'], 'ok')
+        self.assertEqual(doc['predicted_pixels'], 225)
+        self.assertEqual(doc['predicted_without_reference_pixels'], 4)
+        self.assertEqual(len(doc['boxes'][0]['prompts']), 1)
+        task = doc['boxes'][0]['prompts'][0]
+        self.assertGreater(task['inside_negative_count'], 0)
+        self.assertEqual(task['selected_candidate'], 0)
+        self.assertIn('excess_reliable_normal', task['candidates'][1]['rejection_reasons'])
+        self.assertTrue(task['candidates'][1]['prompt_consistent'])
+        self.assertEqual(doc['config']['guidance']['policy'], 'reference_anomaly_core_near_normal_v1')
+        self.assertIn('scores', doc['source'])
+        self.assertIn('confidence', doc['source'])
+        self.assertIn('guidance_sha256', doc)
+        _frozen_prediction(path)  # Verifies extra guidance artifact hash as well.
+        with np.load(path.parent / doc['artifacts']['candidates']) as masks:
+            np.testing.assert_array_equal(masks['box_0_task_0'], backend.raw)
+        with np.load(path.parent / doc['artifacts']['guidance']) as evidence:
+            self.assertTrue(evidence['box_0_core'].any())
+            self.assertFalse((evidence['box_0_core'] & evidence['box_0_normal']).any())
+        self.assertNotIn('never_open_gt', json.dumps(doc))
+
+    def test_guided_rejects_all_candidates_without_falling_back_or_clipping(self):
+        class BloatedBackend(SyntheticBackend):
+            def predict(self, *, points_xy, point_labels, **kwargs):
+                mask = np.ones(self.rgb.shape[:2], bool)
+                for (x, y), label in zip(points_xy, point_labels):
+                    mask[y, x] = bool(label)
+                return mask[None], np.array([.99])
+        path = self.run_prediction(mode='anomaly_guided', backend=BloatedBackend())
+        doc = json.loads(path.read_text())
+        self.assertTrue(doc['model_executed'])
+        self.assertEqual(doc['status'], 'abstained')
+        self.assertEqual(doc['predicted_pixels'], 0)
+        task = doc['boxes'][0]['prompts'][0]
+        self.assertEqual(task['status'], 'no_evidence_consistent_candidate')
+        self.assertIsNone(task['selected_candidate'])
+
+    def test_guided_preview_does_not_load_model_and_saves_hashed_evidence(self):
+        with patch('reference_anomaly.sam3_prediction.OfficialSam3Backend', side_effect=AssertionError('model loaded')):
+            path = self.run_prediction(mode='anomaly_guided', prepare_only=True)
+        doc = json.loads(path.read_text())
+        self.assertFalse(doc['model_executed'])
+        self.assertNotIn('mask', doc['artifacts'])
+        self.assertEqual(_sha(path.parent / doc['artifacts']['guidance']), doc['artifact_sha256']['guidance'])
+
+    def test_tracker_box_uses_same_transformers_tracker_without_anomaly_inputs(self):
+        model_dir = self.root / 'hf_tracker'
+        model_dir.mkdir()
+        for name in ('model.safetensors', 'config.json', 'processor_config.json'):
+            (model_dir / name).write_bytes(b'synthetic bundle never loaded')
+        for name in ('scores.npz', 'confidence.png'):
+            (self.anomaly / name).unlink()
+        with patch('reference_anomaly.sam3_prediction.TransformersSam3Backend', return_value=SyntheticBackend()) as constructor:
+            path = run_prediction(self.result, checkpoint=model_dir, config_path=self.config,
+                                  mode='tracker_box', context_fraction=.5)
+        self.assertEqual(constructor.call_args.kwargs['task'], 'tracker')
+        doc = json.loads(path.read_text())
+        self.assertNotIn('scores', doc['source'])
+        self.assertNotIn('confidence', doc['source'])
+        self.assertEqual(doc['boxes'][0]['prompts'][0]['point_labels'], [])
+        self.assertEqual(doc['config']['selection'], 'all_prompt_consistent_then_max_sam_quality')
+
+    def test_guided_and_tracker_box_cli_modes_and_reject_unsupported_image_semantics(self):
+        for mode in ('tracker_box', 'anomaly_guided'):
+            with patch('reference_anomaly.sam3_prediction.run_prediction', return_value=Path('frozen.json')) as run:
+                with patch('builtins.print'):
+                    self.assertEqual(main(['--result', str(self.result), '--mode', mode]), 0)
+            self.assertEqual(run.call_args.kwargs['mode'], mode)
+        backend = SyntheticBackend()
+        backend.candidate_semantics = 'instances'
+        with self.assertRaisesRegex(ValueError, 'interactive alternative'):
+            self.run_prediction(mode='anomaly_guided', backend=backend)
+
     def test_invalid_options_fail_before_model_loading_or_export(self):
         for options in (dict(threshold=float('nan')), dict(mask_threshold=2),
-                        dict(device='invalid'), dict(text=''), dict(mode='anomaly_points', text='defect')):
+                        dict(device='invalid'), dict(text=''), dict(mode='anomaly_points', text='defect'),
+                        dict(context_fraction=-1), dict(context_fraction=float('inf')),
+                        dict(context_fraction=float('nan'))):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.run_prediction(prepare_only=True, **options)
         self.assertFalse((self.anomaly / 'sam3_anomaly_points_prepared').exists())

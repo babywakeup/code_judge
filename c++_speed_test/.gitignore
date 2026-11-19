@@ -1,8 +1,0 @@
-build/
-*.dll
-*.so
-*.dylib
-*.lib
-*.exp
-*.obj
-*.pdb

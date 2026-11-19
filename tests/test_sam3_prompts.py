@@ -64,6 +64,40 @@ class PromptTests(unittest.TestCase):
                 self.assertIsNone(record['roi_xyxy'])
                 self.assertEqual(record['prompts'], [])
 
+    def test_expanded_crop_preserves_original_prompt_box_in_both_modes(self):
+        for mode in ('box', 'anomaly_points'):
+            with self.subTest(mode=mode):
+                record = self.plan(mode=mode, context_fraction=.5)[0]
+                self.assertEqual(record['roi_xyxy'], [20, 10, 100, 90])
+                self.assertEqual(record['box_xyxy'], [40, 30, 80, 70])
+                for task in record['prompts']:
+                    self.assertEqual(task['box_xyxy'], [20, 20, 60, 60])
+                    for x, y in self.global_points(record, task, 1):
+                        self.assertTrue(40 <= x < 80 and 30 <= y < 70)
+                        self.assertGreaterEqual(self.score[y, x], 3)
+                    for x, y in self.global_points(record, task, 0):
+                        self.assertFalse(40 <= x < 80 and 30 <= y < 70)
+
+    def test_expanded_crop_clips_to_image_without_expanding_prompt(self):
+        for fraction in (2., 1e308):
+            record = self.plan(mode='box', context_fraction=fraction)[0]
+            self.assertEqual(record['roi_xyxy'], [0, 0, 120, 100])
+            self.assertEqual(record['prompts'][0]['box_xyxy'], [40, 30, 80, 70])
+        record = self.plan([DetectionBox(-5, -4, 25, 25)], mode='box', context_fraction=.5)[0]
+        self.assertEqual(record['roi_xyxy'], [0, 0, 41, 41])
+        self.assertEqual(record['box_xyxy'], [-5, -4, 25, 25])
+        self.assertEqual(record['prompts'][0]['box_xyxy'], [0, 0, 25, 25])
+        self.assertEqual(CONFIG['context_fraction'], .1)  # No global default mutation.
+
+    def test_context_fraction_validation_even_without_detections(self):
+        for fraction in (-.1, float('nan'), float('inf'), -float('inf'), True, None, '0.5'):
+            for mode in ('box', 'anomaly_points'):
+                with self.subTest(fraction=fraction, mode=mode), self.assertRaisesRegex(
+                        ValueError, 'context_fraction'):
+                    self.plan([], mode=mode, context_fraction=fraction)
+        record = self.plan(mode='box', context_fraction=0)[0]
+        self.assertEqual(record['roi_xyxy'], [24, 14, 96, 86])  # Minimum 16px remains.
+
     def test_anomaly_coordinates_for_clipped_bottom_right_detection(self):
         self.score[:] = 0
         self.score[94:100, 114:120] = 4
