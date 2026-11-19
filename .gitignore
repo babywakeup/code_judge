@@ -15,3 +15,5 @@ periodic_template_matcher/**/__pycache__/
 *.log
 source/
 参考资料/
+# Local model weights (multi-GB downloads and partial files)
+weights/

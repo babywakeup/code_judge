@@ -1,6 +1,7 @@
 """Fill missing vertical support of a confirmed identity, never horizontal copies."""
 import unittest
 
+import cv2
 import numpy as np
 
 from periodic_template_matcher import MatcherConfig
@@ -36,6 +37,12 @@ class ObjectCompletionTests(unittest.TestCase):
         np.testing.assert_array_equal(prediction.labels, truth)
         self.assertTrue(prediction.valid.all())
         self.assertGreater(prediction.diagnostics['support_completion']['added_valid_pixels'], 0)
+        self.assertTrue(prediction.reference_pieces)
+        for piece in prediction.reference_pieces:
+            self.assertEqual(piece.kind, 'object_support')
+            self.assertEqual(piece.template_index, 0)
+            warped = cv2.warpPerspective(source, piece.matrix, (target.shape[1], target.shape[0]))
+            np.testing.assert_array_equal(warped[piece.mask], target[piece.mask])
 
     def test_nonmatching_missing_region_stays_unknown(self):
         from periodic_template_matcher._internal.objects.completion import complete_object_support

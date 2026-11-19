@@ -5,7 +5,7 @@ import numpy as np
 
 from ...config import MatcherConfig
 from ...utils import warp_labels, warp_valid_mask
-from ..models import MatchResult, PreparedInputs, RegisteredMatch, TransferredLabels
+from ..models import MatchResult, PreparedInputs, ReferencePiece, RegisteredMatch, TransferredLabels
 from .periodic import complete_periodic
 
 
@@ -27,6 +27,8 @@ class LabelTransferStep:
         valid &= inputs.target_roi
         mapped[~valid] = 0
         match.result.mapped_labels, match.result.label_valid = mapped, valid
+        match.result.reference_pieces.append(ReferencePiece(index, match.matrix.copy(),
+            match.result.geometric_valid.copy() & inputs.target_roi, 'direct'))
         return TransferredLabels(labels, source_roi)
 
 
@@ -68,6 +70,10 @@ class PeriodicCompletionStep:
             complete_periodic(other, transferred.labels, transferred.annotation_valid,
                               inputs.template_valids[index], inputs.target_roi, config)
             fill = other.label_valid & inputs.target_roi & ~result.label_valid
+            for piece in other.reference_pieces:
+                piece.mask &= fill
+                if piece.mask.any():
+                    result.reference_pieces.append(piece)
             result.mapped_labels[fill] = other.mapped_labels[fill]
             result.label_valid |= fill
             result.label_periodic_valid |= other.label_periodic_valid & fill

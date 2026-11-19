@@ -86,7 +86,7 @@ assert callable(run_config)
                          {'__init__.py', 'pipeline.py', 'models.py'})
         self.assertEqual({p.name for p in internal.iterdir()
                           if p.is_dir() and p.name != '__pycache__'},
-                         {'registration', 'objects', 'segmentation', 'io'})
+                         {'registration', 'objects', 'segmentation', 'reference', 'io'})
 
     def test_all_domain_modules_import_in_a_fresh_interpreter(self):
         code = '''

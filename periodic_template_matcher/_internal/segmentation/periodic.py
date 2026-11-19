@@ -13,7 +13,7 @@ from ...utils import ValidRegion, to_gray, warp_labels, warp_valid_mask
 from ...utils.types import Array, BoolMask, LabelMap, Mask
 from ..registration.core import _features
 from ..registration.scoring import _refine, _score
-from ..models import MatchResult
+from ..models import MatchResult, ReferencePiece
 
 
 def anchor_vectors(labels: LabelMap, valid: Mask, class_id: int) -> list[Array]:
@@ -246,6 +246,9 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         fill_image = geom & target_valid & ~result.completed_valid & approved
         warped = cv2.warpPerspective(source, candidate, (w, h))
         result.completed_template[fill_image] = warped[fill_image]
+        if fill_image.any():
+            result.reference_pieces.append(ReferencePiece(result.best_template_index,
+                candidate.copy(), fill_image.copy(), 'periodic'))
         result.completed_valid |= fill_image
         result.periodic_valid |= fill_image
         record['added_label_pixels'] = int(fill_labels.sum())

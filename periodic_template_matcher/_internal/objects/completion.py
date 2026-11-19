@@ -15,6 +15,7 @@ from ...utils import ValidRegion, to_gray, warp_valid_mask
 from ..segmentation.periodic import _candidate_fill
 from ..registration.core import _features
 from ..registration.scoring import _ncc, _score
+from ..models import ReferencePiece
 from .axes import transpose_image, transpose_config, transpose_prediction
 
 
@@ -43,6 +44,7 @@ def complete_object_support(prediction, images, references, source_valids,
         prediction.labels[:] = restored.labels
         prediction.identities[:] = restored.identities
         prediction.valid[:] = restored.valid
+        prediction.reference_pieces = restored.reference_pieces
         # Preserve the registration dictionary's reference to this diagnostics map.
         prediction.diagnostics.clear()
         prediction.diagnostics.update(restored.diagnostics)
@@ -177,6 +179,9 @@ def complete_object_support(prediction, images, references, source_valids,
                     if accepted:
                         approved |= region
                         approved_labels[region] = region_mapped[region]
+                        prediction.reference_pieces.append(ReferencePiece(ti,
+                            np.asarray(corrected if corrected is not None else candidate).copy(),
+                            region.copy(), 'object_support'))
                         if corrected is not None:
                             obj.setdefault('supporting_transforms', []).append(corrected)
                     elif not is_tile:

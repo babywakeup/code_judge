@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from ..utils.types import BoolMask, Diagnostics, Image, LabelMap, Mask, Matrix
+
+
+@dataclass
+class ReferencePiece:
+    """Exact accepted source geometry and target pixels, before photometry."""
+
+    template_index: int
+    matrix: Matrix
+    mask: BoolMask
+    kind: str
 
 
 @dataclass
@@ -33,6 +43,11 @@ class MatchResult:
     object_valid: BoolMask | None = None
     base_labels: LabelMap | None = None
     base_valid: BoolMask | None = None
+    supposed_to_be_good: Image | None = None
+    reference_valid: BoolMask | None = None
+    reference_photometric_valid: BoolMask | None = None
+    reference_source_map: LabelMap | None = None
+    reference_pieces: list[ReferencePiece] = field(default_factory=list, repr=False)
 
     @property
     def accepted(self) -> bool:

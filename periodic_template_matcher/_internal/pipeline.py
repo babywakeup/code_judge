@@ -1,5 +1,6 @@
 """Explicit inference order. This module owns control flow, not image algorithms."""
 
+import cv2
 import numpy as np
 
 from ..config import MatcherConfig
@@ -7,6 +8,7 @@ from .models import MatchResult, PreparedInputs
 from .objects.fusion import PredictionFusionStep
 from .objects.steps import ObjectSupportCompletionStep, OrderedObjectStep
 from .registration.step import RegistrationStep
+from .reference.step import NormalReferenceStep
 from .segmentation.transfer import LabelTransferStep, PeriodicCompletionStep
 
 
@@ -29,6 +31,7 @@ class MatchPipeline:
         self.periodic_completion = PeriodicCompletionStep()
         self.object_support = object_support if object_support is not None else ObjectSupportCompletionStep()
         self.fusion = PredictionFusionStep()
+        self.normal_reference = NormalReferenceStep()
 
     def run(self, inputs: PreparedInputs) -> MatchResult:
         match = self.registration.run(inputs, self.config)
@@ -52,6 +55,8 @@ class MatchPipeline:
                 result.object_valid = result.label_valid.copy()
                 result.base_labels = np.zeros_like(prediction.labels)
                 result.base_valid = np.zeros_like(result.label_valid)
+                self._object_reference(inputs, match, located)
+                self.normal_reference.run(inputs, result)
             return match.result
 
         transferred = self.label_transfer.run(inputs, match, self.config)
@@ -59,4 +64,30 @@ class MatchPipeline:
         if located is not None:
             self.object_support.run(inputs, match, located, self.config)
             self.fusion.run(inputs, match, located, self.config)
+            self._object_reference(inputs, match, located)
+        self.normal_reference.run(inputs, match.result)
         return match.result
+
+    @staticmethod
+    def _object_reference(inputs, match, located):
+        result = match.result
+        # Global alignment cannot place independently localized objects. Remove
+        # their old source footprints before pasting verified instance geometry.
+        if inputs.objects is not None:
+            source_masks = {}
+            for piece in result.reference_pieces:
+                index = piece.template_index
+                if index not in source_masks:
+                    mask = np.zeros(inputs.templates[index].shape[:2], np.uint8)
+                    for obj in inputs.objects[index]:
+                        mask |= (obj['mask'] > 0).astype(np.uint8)
+                    source_masks[index] = mask
+                footprint = cv2.warpPerspective(source_masks[index].astype(np.float32), piece.matrix,
+                    (inputs.target.shape[1], inputs.target.shape[0])) > 0
+                piece.mask &= ~footprint
+        for piece in located.prediction.reference_pieces:
+            # Only actual instance foreground can override base reference geometry.
+            positive = (result.object_identities > 0) & (located.prediction.labels > 0)
+            piece.mask &= positive & inputs.target_roi
+            if piece.mask.any():
+                result.reference_pieces.append(piece)

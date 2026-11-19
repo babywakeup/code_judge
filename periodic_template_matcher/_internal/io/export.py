@@ -22,6 +22,8 @@ ARTIFACTS = (
     'demo_source_labels.png', 'demo_mapped_labels.png', 'demo_label_valid.png',
     'demo_label_overlay.jpg', 'periodic_overlay.html', 'completed_alignment.jpg',
     'completed_geometric_valid.png', 'periodic_valid.png', 'completion_regions.jpg',
+    'supposed_to_be_good.png', 'reference_valid.png', 'reference_photometric_valid.png',
+    'reference_source_map.png',
 )
 
 
@@ -55,6 +57,21 @@ def save_result(result: MatchResult | EvaluationResult, output_dir: PathInput) -
     if evaluation is not None:
         if evaluation.ground_truth.shape != shape or evaluation.ground_truth_valid.shape != shape:
             raise ValueError('ground truth shapes must match input image')
+    reference_arrays = (match.supposed_to_be_good, match.reference_valid,
+                        match.reference_photometric_valid, match.reference_source_map)
+    has_reference = match.accepted and match.supposed_to_be_good is not None
+    if any(array is not None for array in reference_arrays):
+        if any(array is None for array in reference_arrays):
+            raise ValueError('Normal reference requires image, validity, photometric validity and source map')
+        if (match.supposed_to_be_good.shape != match.input_image.shape
+                or match.supposed_to_be_good.dtype != np.uint8
+                or any(array.shape != shape for array in reference_arrays[1:])
+                or match.reference_source_map.dtype != np.uint16):
+            raise ValueError('Normal reference arrays must match original input shape and dtypes')
+        valid = match.reference_valid > 0
+        if (np.any((match.reference_source_map > 0) != valid)
+                or np.any((match.reference_photometric_valid > 0) & ~valid)):
+            raise ValueError('Normal reference validity must agree with source IDs and photometric validity')
 
     metadata: Diagnostics = dict(match.registration)
     metadata.update(format_version=1, image_shape=list(shape), labels_exported=bool(has_prediction),
@@ -64,6 +81,11 @@ def save_result(result: MatchResult | EvaluationResult, output_dir: PathInput) -
                     annotation_status='exported' if has_prediction else
                     'blocked_by_match' if not match.accepted else 'not_available')
     artifacts = {'input': 'input.png', 'geometric_valid': 'geometric_valid.png'}
+    if has_reference:
+        artifacts.update(supposed_to_be_good='supposed_to_be_good.png',
+                         reference_valid='reference_valid.png',
+                         reference_photometric_valid='reference_photometric_valid.png',
+                         reference_source_map='reference_source_map.png')
     if match.matrix_template_to_target is not None:
         artifacts['transform'] = 'matrix_template_to_target.npy'
     if has_prediction:
@@ -93,6 +115,11 @@ def save_result(result: MatchResult | EvaluationResult, output_dir: PathInput) -
         (out / name).unlink(missing_ok=True)
     write_image(out / artifacts['input'], match.input_image)
     write_image(out / artifacts['geometric_valid'], match.geometric_valid.astype(np.uint8) * 255)
+    if has_reference:
+        write_image(out / artifacts['supposed_to_be_good'], match.supposed_to_be_good)
+        write_image(out / artifacts['reference_valid'], match.reference_valid.astype(np.uint8)*255)
+        write_image(out / artifacts['reference_photometric_valid'], match.reference_photometric_valid.astype(np.uint8)*255)
+        write_image(out / artifacts['reference_source_map'], match.reference_source_map)
     if 'transform' in artifacts:
         np.save(out / artifacts['transform'], match.matrix_template_to_target)
     if has_prediction:

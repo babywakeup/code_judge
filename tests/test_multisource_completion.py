@@ -53,8 +53,14 @@ class MultiSourceCompletionTests(unittest.TestCase):
                 if approved:
                     self.assertTrue(result.label_valid.all())
                     np.testing.assert_array_equal(result.mapped_labels, labels)
+                    self.assertTrue(result.reference_valid.all())
+                    self.assertTrue((result.reference_source_map[:, :80] > 0).all())
+                    pieces = result.registration['normal_reference']['pieces']
+                    self.assertTrue(any(p['template_index'] == 1 for p in pieces))
+                    np.testing.assert_allclose(result.supposed_to_be_good, image, atol=1)
                 else:
                     self.assertFalse(result.label_valid[:, :60].any())
+                    self.assertFalse(result.reference_valid[:, :60].any())
 
     def test_local_object_refinement_corrects_small_alignment_error(self):
         from periodic_template_matcher._internal.objects.matching import refine_object_transform

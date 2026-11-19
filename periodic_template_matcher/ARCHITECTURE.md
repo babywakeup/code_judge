@@ -22,9 +22,10 @@
 | [registration/step.py](_internal/registration/step.py) | 配准领域 | `RegistrationStep`；同目录的 core / opencv 模块提供数值算法 |
 | [objects/steps.py](_internal/objects/steps.py) | 实例领域 | `OrderedObjectStep`、`ObjectSupportCompletionStep`；matching / completion / axes / fusion 同目录 |
 | [segmentation/transfer.py](_internal/segmentation/transfer.py) | 分割领域 | `LabelTransferStep`、`PeriodicCompletionStep`；preparation / periodic / evaluation 同目录 |
+| [reference/step.py](_internal/reference/step.py) | 正常参考图领域 | `NormalReferenceStep`；稳健光度拟合、模板片段拼接与来源映射 |
 | [io/workflow.py](_internal/io/workflow.py) | 文件流程领域 | JSON 路径和配置工作流；annotations / export 同目录 |
 
-内部顶层只有包入口、流水线和共享模型三个 Python 文件，另有四个功能目录。
+内部顶层只有包入口、流水线和共享模型三个 Python 文件，另有五个功能目录。
 旧平铺模块和旧步骤目录已删除，不保留转发文件、动态导入别名或重复实现。
 
 ### 算法模块的阅读顺序
@@ -68,15 +69,20 @@ flowchart TD
     Accepted -- 是 --> Transfer[4 LabelTransferStep]
     Transfer --> Periodic[5 PeriodicCompletionStep]
     Periodic --> Located{启用了独立实例分支?}
-    Located -- 否 --> Return
+    Located -- 否 --> Reference[8 NormalReferenceStep]
     Located -- 是 --> Support[6 ObjectSupportCompletionStep]
     Support --> Fusion[7 PredictionFusionStep]
-    Fusion --> Return
+    Fusion --> Reference
+    Reference --> Return
 ```
 
 注意：步骤 3 必须在“匹配是否接受”的最终判断之前执行。只有模板分数接近
 （`templates_too_close`）时，强实例证据才可能解除模板选择歧义；它不能把普通低分匹配改成接受。
 步骤 6 必须在步骤 5 后面，因为它依赖基础周期分支验证过的几何关系。
+步骤 8 使用直接配准、周期补全和实例分支记录的 `ReferencePiece`，保持各片段的实际变换与覆盖范围；
+校正目标是输入图的亮度和对比度，输出参考图及独立的几何、光度有效性与来源映射。
+临时片段 mask 在构建后释放；逐片段变换及校正参数保留在 `normal_reference.pieces`。
+仅实例接受的提前返回分支也执行步骤 8，只覆盖实际实例前景。
 
 ## 3. 每个功能所属的类
 

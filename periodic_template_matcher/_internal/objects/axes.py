@@ -7,6 +7,8 @@ from dataclasses import replace
 
 import numpy as np
 
+from ..models import ReferencePiece
+
 
 SWAP = np.array([[0., 1., 0.], [1., 0., 0.], [0., 0., 1.]])
 
@@ -55,4 +57,7 @@ def transpose_diagnostics(value):
 
 def transpose_prediction(prediction):
     return type(prediction)(transpose_image(prediction.labels), transpose_image(prediction.identities),
-                            transpose_image(prediction.valid), transpose_diagnostics(prediction.diagnostics))
+                            transpose_image(prediction.valid), transpose_diagnostics(prediction.diagnostics),
+                            [ReferencePiece(p.template_index, np.asarray(transpose_matrix(p.matrix)),
+                                            transpose_image(p.mask), p.kind)
+                             for p in prediction.reference_pieces])

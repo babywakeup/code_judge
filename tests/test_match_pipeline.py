@@ -172,6 +172,7 @@ class PipelineOrderTests(unittest.TestCase):
 
     def test_full_execution_order(self):
         located = Mock()
+        located.prediction.reference_pieces = []
         self.pipeline.ordered_objects.run.side_effect = lambda *args: self.record('ordered_objects', located)
         self.assertIs(self.pipeline.run(self.inputs), self.match.result)
         self.assertEqual(self.calls, ['registration', 'ordered_objects', 'label_transfer',
@@ -195,7 +196,9 @@ class PipelineOrderTests(unittest.TestCase):
 
         def locate(*args):
             self.match.result.registration['accepted'] = True
-            return self.record('ordered_objects', Mock())
+            located = Mock()
+            located.prediction.reference_pieces = []
+            return self.record('ordered_objects', located)
 
         self.pipeline.ordered_objects.run.side_effect = locate
         self.pipeline.run(self.inputs)

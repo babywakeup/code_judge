@@ -236,6 +236,45 @@ API 的 `mapped_labels` / `label_valid` 为最终预测；`geometric_valid` / `w
   `geometry_accepted` 仅表示图像几何通过全局验证，`accepted` 表示确有通过局部验证的标签补全。
   独立实例不会仅凭前者填充，还必须通过自身的逐区域验证。
 
+## 与输入图亮度、对比度一致的正常参考图
+
+`match()` 在已接受的分割预测后自动构建 `supposed_to_be_good`，无需新增配置。
+参考图使用正常模板的实际像素，应用直接配准、通过验证的周期副本和独立实例局部变换，
+每个来源片段分别拟合 `corrected = gain * template + offset`，目标是当前输入图的亮度、对比度。
+输入图只参与参数估计，不会被粘贴进正常参考图；不使用 XML 缺陷矩形框或目标分割真值。
+
+拟合排除饱和像素、强边缘，并用稳健初值与残差迭代排除缺陷干扰。
+灰度拟合一个通道，彩色按 BGR 通道拟合，alpha 不参与校正。
+重叠区域采用确定的来源优先级，独立实例使用最终通过验证的局部变换。
+基础参考中原来的实例前景会先排除，再由独立实例片段覆盖，避免实例移位后留下旧结构。
+亚像素变换按双线性插值所需的完整有效源像素确定参考范围，防止混入有效高度之外的底部文字。
+不跨不同模板混合结构纹理，避免拼接模糊；片段接缝、残余错位仍可能产生差异。
+
+`save_result()` 在原 `--out` 目录增加以下文件，既有 segmentation 文件保持原格式：
+
+| 文件 | 含义 |
+|---|---|
+| `supposed_to_be_good.png` | 与输入同尺寸、同坐标的校正后正常参考图 |
+| `reference_valid.png` | 有已验证模板片段覆盖的位置，255 有效；无参考处图像为 0 |
+| `reference_photometric_valid.png` | 片段具有足够正常像素、对比度且稳健拟合通过的位置 |
+| `reference_source_map.png` | uint16 来源片段 ID；0 为无参考，对应 `normal_reference.pieces[].source_id` |
+| `result.json` 的 `normal_reference` | 各片段模板索引、变换、覆盖数量、gain/offset、拟合质量与回退状态 |
+
+数组 API 对应 `result.supposed_to_be_good`、`result.reference_valid`、
+`result.reference_photometric_valid`、`result.reference_source_map`。
+局部拟合证据不足时尝试可靠的全局校正；仍不可用则保留模板原值。
+回退片段的光度可信 mask 始终为 0。后续自动差异分析应同时检查两个有效 mask，
+并结合配准精度解释边缘和接缝，不能将整张参考图视为精确真值。
+全图匹配失败而仅局部实例通过时，只输出实际有来源的实例区域；完全拒绝时不导出参考图，
+重跑会清理上一次的参考文件。大面积缺陷或非线性光照仍可能使线性拟合失效。
+
+```powershell
+.venv\Scripts\python.exe -m periodic_template_matcher --config periodic_template_matcher/config.sd1.labelme.opencv.json --out periodic_template_matcher/results/sd1_opencv
+```
+
+若需要使用正常参考图突出输入图中的异常，见独立的
+[reference_anomaly 模块](../reference_anomaly/README.md)。它读取既有结果，无需重新运行模板匹配。
+
 ## 类别 2：N 个不同实例的循环排列
 
 类别 2 包含 N 个不同实例，每个身份在横向只匹配一次。“横向周期=1”表示不存在保持该身份结构

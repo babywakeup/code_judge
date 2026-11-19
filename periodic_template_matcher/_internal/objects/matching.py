@@ -4,7 +4,7 @@ No label map is periodically tiled here. Each candidate comes from an original
 object reference and actual visible target pixels; order only resolves candidates.
 """
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -13,6 +13,7 @@ from ...config import MatcherConfig
 from ...utils import ValidRegion, to_gray, warp_valid_mask
 from ...utils.types import BoolMask, Diagnostics, Image, LabelMap, Mask, Matrix
 from ..registration.core import _features
+from ..models import ReferencePiece
 from ..registration.scoring import _refine, _score
 from .appearance import _correlation_peaks
 from .axes import transpose_image, transpose_matrix, transpose_config, transpose_prediction
@@ -27,6 +28,7 @@ class ObjectPrediction:
     identities: LabelMap
     valid: BoolMask
     diagnostics: Diagnostics
+    reference_pieces: list[ReferencePiece] = field(default_factory=list, repr=False)
 
 
 def refine_object_transform(image, mask, source_valid, target, target_valid, matrix, cfg):
@@ -201,6 +203,7 @@ def match_ordered_objects(
         return ObjectPrediction(labels, identities, known, info)
     info['status'] = 'accepted'
     known = target_valid > 0
+    reference_pieces = []
     for chosen_object in chosen:
         name = chosen_object['identity']
         selected = [c for c in pools[name]['all'] if abs(c['center_x']-chosen_object['center_x']) < 8/scale
@@ -224,6 +227,9 @@ def match_ordered_objects(
                 candidate['_support'] = warp_valid_mask(source_valids[ti], refined, target.shape)
             combined |= candidate['_mask']
             support |= candidate['_support']
+            reference_pieces.append(ReferencePiece(candidate['template_index'],
+                np.asarray(candidate['matrix_template_to_target']).copy(),
+                candidate['_mask'].copy(), 'object'))
         # Missing vertical source support cannot be invented at target boundaries.
         ys, xs = np.where(combined)
         band = np.zeros(shape, bool)
@@ -246,4 +252,4 @@ def match_ordered_objects(
     known |= labels > 0
     known &= target_valid > 0
     info['valid_coverage_roi'] = float(known.sum()/max(int((target_valid > 0).sum()), 1))
-    return ObjectPrediction(labels, identities, known, info)
+    return ObjectPrediction(labels, identities, known, info, reference_pieces)
