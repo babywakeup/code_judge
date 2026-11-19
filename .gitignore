@@ -15,3 +15,4 @@ periodic_template_matcher/**/__pycache__/
 *.log
 source/
 参考资料/
+weights/
