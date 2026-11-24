@@ -7,6 +7,7 @@ from .models import MatchResult, PreparedInputs
 from .objects.fusion import PredictionFusionStep
 from .objects.steps import ObjectSupportCompletionStep, OrderedObjectStep
 from .registration.step import RegistrationStep
+from .segmentation.instances import complete_periodic_instances
 from .segmentation.transfer import LabelTransferStep, PeriodicCompletionStep
 
 
@@ -50,13 +51,31 @@ class MatchPipeline:
                 result.label_valid = (prediction.labels > 0) & inputs.target_roi
                 result.object_identities = prediction.identities.copy()
                 result.object_valid = result.label_valid.copy()
+                result.object_labels = np.where(inputs.target_roi, prediction.labels, 0).astype(np.uint16)
+                result.object_layer_valid = (prediction.labels > 0) & inputs.target_roi
+                result.object_layer_identities = np.where(result.object_layer_valid,
+                                                          prediction.identities, 0).astype(np.uint16)
                 result.base_labels = np.zeros_like(prediction.labels)
                 result.base_valid = np.zeros_like(result.label_valid)
             return match.result
 
         transferred = self.label_transfer.run(inputs, match, self.config)
         self.periodic_completion.run(inputs, match, transferred, self.config)
+        result = match.result
+        if result.label_periodic_valid is not None:
+            result.completion_valid = result.label_periodic_valid.copy()
+            result.completion_labels = np.where(result.completion_valid, result.mapped_labels, 0).astype(np.uint16)
         if located is not None:
             self.object_support.run(inputs, match, located, self.config)
             self.fusion.run(inputs, match, located, self.config)
+        complete_periodic_instances(match.result, inputs.target_roi, self.config,
+            reference=dict(labels=transferred.labels, annotation_valid=transferred.annotation_valid,
+                           source_valid=inputs.template_valids[match.template_index],
+                           template_index=match.template_index))
+        # Late, independently verified semantic repairs are also completion
+        # evidence. Do not clear the pre-fusion evidence under object positives.
+        if result.completion_valid is not None:
+            late = result.label_periodic_valid & ~result.completion_valid
+            result.completion_labels[late] = result.mapped_labels[late]
+            result.completion_valid |= late
         return match.result

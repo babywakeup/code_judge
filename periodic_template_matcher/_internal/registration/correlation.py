@@ -12,6 +12,24 @@ def _corr(a: Array, b: Array, fft_shape: Shape) -> Array:
     return np.fft.irfft2(fa * np.conj(fb), s=fft_shape).real
 
 
+def _correlations(pairs: list[tuple[Array, Array]], fft_shape: Shape) -> list[Array]:
+    """Reuse forward spectra, preserving each product and inverse's arithmetic.
+
+    The pairs keep operands alive; identity keys cannot be recycled during this
+    call. No spectra survive an image or get reused for a different FFT shape.
+    """
+    spectra = {}
+    results = []
+    for a, b in pairs:
+        for operand in (a, b):
+            key = id(operand)
+            if key not in spectra:
+                spectra[key] = np.fft.rfft2(operand, s=fft_shape)
+        results.append(np.fft.irfft2(spectra[id(a)] * np.conj(spectra[id(b)]),
+                                    s=fft_shape).real)
+    return results
+
+
 def _translation_peaks(source: Array, target: Array, sm: Mask, tm: Mask,
                        cfg: MatcherConfig) -> list[tuple[float, float, float]]:
     """Linear (not circular) normalized correlation, multiple displacement peaks."""
@@ -20,10 +38,8 @@ def _translation_peaks(source: Array, target: Array, sm: Mask, tm: Mask,
     shape = (cv2.getOptimalDFTSize(sh + th - 1), cv2.getOptimalDFTSize(sw + tw - 1))
     ys, xs = np.arange(-sh + 1, th), np.arange(-sw + 1, tw)
     index = np.ix_(ys % shape[0], xs % shape[1])
-    overlap = _corr(tm, sm, shape)[index]
-    num = _corr(target, source, shape)[index]
-    den1 = _corr(target * target, sm, shape)[index]
-    den2 = _corr(tm, source * source, shape)[index]
+    overlap, num, den1, den2 = [value[index] for value in _correlations(
+        [(tm, sm), (target, source), (target * target, sm), (tm, source * source)], shape)]
     corr = num / np.sqrt(np.maximum(den1 * den2, 1e-8))
     cov = np.maximum(overlap, 0) / max(float(tm.sum()), 1)
     eligible = (cov >= cfg.min_overlap) & (overlap >= cfg.min_overlap * sm.sum())
@@ -44,9 +60,10 @@ def _periods(feature: Array, mask: Mask) -> list[Diagnostics]:
     h, w = feature.shape
     shape = (cv2.getOptimalDFTSize(2*h-1), cv2.getOptimalDFTSize(2*w-1))
     centered = (feature - feature[mask > 0].mean()) * mask
-    corr = _corr(centered, centered, shape)
-    energy = np.sqrt(np.maximum(_corr(centered*centered, mask, shape) * _corr(mask, centered*centered, shape), 1e-9))
-    overlap = _corr(mask, mask, shape)
+    squared = centered * centered
+    corr, den1, den2, overlap = _correlations(
+        [(centered, centered), (squared, mask), (mask, squared), (mask, mask)], shape)
+    energy = np.sqrt(np.maximum(den1 * den2, 1e-9))
     result = []
     for axis, limit in ((0, h), (1, w)):
         stop = int(limit * 0.7)

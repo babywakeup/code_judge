@@ -15,14 +15,16 @@ def _correlation_peaks(patch: Array, mask: Mask, target: Array, valid: Mask,
     valid = np.ascontiguousarray(valid, np.float32)
     target = np.ascontiguousarray(target*valid, np.float32)
 
-    def corr(a, b):
-        return cv2.matchTemplate(cv2.copyMakeBorder(a, ph-1, ph-1, pw-1, pw-1,
-                                  cv2.BORDER_CONSTANT, value=0), b, cv2.TM_CCORR)
+    def pad(image):
+        return cv2.copyMakeBorder(image, ph-1, ph-1, pw-1, pw-1, cv2.BORDER_CONSTANT, value=0)
 
-    count = np.maximum(corr(valid, mask), 0)
-    st, ss = corr(target, mask), corr(valid, patch)
-    et, es = corr(target*target, mask), corr(valid, patch*patch)
-    cross = corr(target, patch)
+    padded_valid, padded_target = pad(valid), pad(target)
+    count = np.maximum(cv2.matchTemplate(padded_valid, mask, cv2.TM_CCORR), 0)
+    st = cv2.matchTemplate(padded_target, mask, cv2.TM_CCORR)
+    ss = cv2.matchTemplate(padded_valid, patch, cv2.TM_CCORR)
+    et = cv2.matchTemplate(pad(target*target), mask, cv2.TM_CCORR)
+    es = cv2.matchTemplate(padded_valid, patch*patch, cv2.TM_CCORR)
+    cross = cv2.matchTemplate(padded_target, patch, cv2.TM_CCORR)
     denominator = np.maximum(count, 1)
     numerator = cross - st*ss/denominator
     target_energy = np.maximum(et-st*st/denominator, 0)

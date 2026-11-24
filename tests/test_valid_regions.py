@@ -78,6 +78,56 @@ class ValidRegionTests(unittest.TestCase):
         self.assertEqual(result.registration['valid_regions']['target']['valid_height'], 145)
         self.assertEqual(result.registration['config']['valid_height'], 140)
 
+    def test_legacy_height_preserves_support_for_thin_valid_bands(self):
+        image = np.random.default_rng(41).integers(0, 256, (128, 128), dtype=np.uint8)
+        matcher = PeriodicTemplateMatcher(MatcherConfig(valid_height=24, max_side=128,
+            angles=(0.,), scales=(1.,), refine_candidates=1, ecc_iterations=10))
+        result = matcher.match([image], [None], image)
+        self.assertEqual(result.geometric_valid.shape, image.shape)
+        self.assertFalse(result.geometric_valid[24:].any())
+
+    def test_rectangle_crops_the_pipeline_and_restores_canvas_and_transform(self):
+        from tests.test_matcher_api import selection
+        cfg = MatcherConfig.from_options(dict(step1=dict(
+            valid_x_start=20, valid_x_end=180, valid_y_start=10, valid_y_end=130)))
+        image = texture()
+        matcher = PeriodicTemplateMatcher(cfg)
+        np.testing.assert_array_equal(matcher.get_valid(image), image[10:130, 20:180])
+        d = selection()
+        d['matches'][0]['matrix_template_to_target'] = [[1.02, 0., 0.], [0., 1.04, 0.], [0., 0., 1.]]
+        local = d['matches'][0]['matrix_template_to_target']
+        d['matches'][0]['candidates'] = [dict(matrix_template_to_target=local)]
+        d['ordered_objects'] = dict(objects=[
+            dict(identity='A', template_index=0, center_x=35., matrix_template_to_target=local,
+                 supporting_references=[dict(template_index=1, matrix_template_to_target=local)],
+                 supporting_transforms=[local])],
+            support_completion=dict(copies=[dict(identity='A', regions=[dict(corrected_matrix=local)])]))
+        d['periodic_completion'] = dict(supplemental_templates=[
+            dict(template_index=1, periodic_completion=dict(copies=[dict(matrix_template_to_target=local)]))])
+        with patch('periodic_template_matcher.matcher.select_templates', return_value=d) as select:
+            labels = np.ones(image.shape[:2], np.uint16)
+            result = matcher.match([image, image], [labels, labels], image)
+        self.assertEqual(select.call_args.args[1].shape[:2], (120, 160))
+        np.testing.assert_array_equal(result.input_image, image)
+        self.assertEqual(result.label_valid.shape, image.shape[:2])
+        self.assertFalse(result.label_valid[:10].any())
+        self.assertFalse(result.label_valid[:, :20].any())
+        self.assertFalse(result.label_valid[130:].any())
+        self.assertFalse(result.label_valid[:, 180:].any())
+        self.assertTrue(result.label_valid[20:120, 30:170].all())
+        expected = [[1.02, 0., -.4], [0., 1.04, -.4], [0., 0., 1.]]
+        np.testing.assert_allclose(result.matrix_template_to_target, expected)
+        np.testing.assert_allclose(result.registration['matches'][0]['candidates'][0]
+                                   ['matrix_template_to_target'], expected)
+        ordered = result.registration['ordered_objects']
+        self.assertEqual(ordered['objects'][0]['center_x'], 55.)
+        np.testing.assert_allclose(ordered['objects'][0]['supporting_transforms'][0], expected)
+        np.testing.assert_allclose(ordered['support_completion']['copies'][0]['regions'][0]['corrected_matrix'],
+                                   expected)
+        supplemental = result.registration['periodic_completion']['supplemental_templates'][0]
+        np.testing.assert_allclose(supplemental['periodic_completion']['copies'][0]['matrix_template_to_target'],
+                                   expected)
+
     def test_footer_does_not_change_matching_for_either_backend(self):
         image = texture()
         changed = image.copy()
@@ -118,6 +168,60 @@ class ValidRegionTests(unittest.TestCase):
         self.assertFalse(result.ground_truth_valid[130:].any())
         self.assertFalse(result.match.label_valid[:10].any())
 
+    def test_configured_matcher_preloads_assets_and_keeps_results_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = texture()
+            write_image(root/'template.png', image)
+            write_image(root/'target.png', image)
+            write_image(root/'labels.png', np.ones(image.shape[:2], np.uint16))
+            path = root/'config.json'
+            path.write_text(json.dumps(dict(
+                target='target.png', target_valid_height=130,
+                templates=[dict(image='template.png', labels='labels.png', valid_height=150)],
+                options=dict(max_side=200, angles=[0], scales=[1], template_workers=1,
+                             refine_candidates=2, ecc_iterations=20))),
+                encoding='utf-8')
+            matcher = PeriodicTemplateMatcher(path)
+            for name in ('config.json', 'template.png', 'target.png', 'labels.png'):
+                (root/name).unlink()
+            first = matcher.infer()
+            self.assertTrue(first.accepted)
+            self.assertTrue((first.mapped_labels[5:120, 20:180] == 1).all())
+            first.template_image[:] = 0
+            first.input_image[:] = 0
+            first.registration['valid_regions']['target']['valid_height'] = 0
+            second = matcher.infer()
+            self.assertTrue(second.template_image.any())
+            self.assertTrue(second.input_image.any())
+            self.assertEqual(second.registration['valid_regions']['target']['valid_height'], 130)
+            self.assertEqual(matcher.infer_to(root/'out')['prediction_status'], 'available')
+
+    def test_configured_matcher_recomputes_scale_for_a_larger_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = texture()
+            target = np.pad(source, ((0, 0), (0, 100), (0, 0)), mode='edge')
+            write_image(root/'source.png', source)
+            write_image(root/'target.png', target)
+            path = root/'config.json'
+            options = dict(max_side=200, angles=[0], scales=[1], template_workers=1,
+                           refine_candidates=2, ecc_iterations=20)
+            path.write_text(json.dumps(dict(templates=[dict(image='source.png')], options=options)),
+                            encoding='utf-8')
+            matcher = PeriodicTemplateMatcher(path)
+            result = matcher.infer('target.png')
+            with patch('periodic_template_matcher.matcher.prepare_registration_sources',
+                       side_effect=AssertionError('Repeated targets at this scale should reuse source features')):
+                repeated = matcher.infer('target.png')
+            expected = PeriodicTemplateMatcher(MatcherConfig.from_options(options)).match(
+                [source], [None], target)
+            self.assertEqual(result.registration['matches'][0]['working_scale'], 200 / target.shape[1])
+            self.assertEqual(result.registration['matches'][0]['candidates'],
+                             expected.registration['matches'][0]['candidates'])
+            self.assertEqual(result.registration, repeated.registration)
+            np.testing.assert_array_equal(result.geometric_valid, expected.geometric_valid)
+
     def test_json_height_exports_and_duplicate_conflict(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -126,7 +230,8 @@ class ValidRegionTests(unittest.TestCase):
             write_image(root/'labels.png', np.ones(image.shape[:2], np.uint16))
             spec = dict(target='image.png', target_valid_height=130,
                         templates=[dict(image='image.png', labels='labels.png', valid_height=150)],
-                        options=dict(valid_height=140, max_side=200,
+                        options=dict(valid_x_start=15, valid_x_end=185, valid_y_start=10, valid_y_end=140,
+                                     max_side=200,
                                      angles=[0], scales=[1], refine_candidates=2, ecc_iterations=20))
             path = root/'config.json'
             path.write_text(json.dumps(spec), encoding='utf-8')
@@ -135,6 +240,10 @@ class ValidRegionTests(unittest.TestCase):
             self.assertEqual(mask.shape, image.shape[:2])
             self.assertTrue(mask[125:130, 20:180].all())
             self.assertFalse(mask[130:].any())
+            self.assertFalse(mask[:10].any())
+            self.assertFalse(mask[:, :15].any())
+            self.assertFalse(mask[:, 185:].any())
+            np.testing.assert_array_equal(read_image(root/'out/input.png'), image)
             self.assertEqual(result['valid_regions']['templates'][0]['valid_height'], 150)
             spec['templates'].append(dict(spec['templates'][0], valid_height=149))
             path.write_text(json.dumps(spec), encoding='utf-8')

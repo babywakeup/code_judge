@@ -18,6 +18,13 @@ class PredictionFusionStep:
         # This snapshot includes base periodic fill, but excludes object fusion.
         result.base_labels = result.mapped_labels.copy()
         result.base_valid = result.label_valid.copy()
+        result.object_layer_valid = (prediction.labels > 0) & inputs.target_roi
+        result.object_labels = np.where(result.object_layer_valid, prediction.labels, 0).astype(np.uint16)
+        result.object_layer_identities = np.where(result.object_layer_valid, prediction.identities, 0).astype(np.uint16)
+        if prediction.semantic_foreground is not None and config is not None and config.ordered_object_class is not None:
+            semantic_layer = prediction.semantic_foreground & inputs.target_roi
+            result.object_labels[semantic_layer] = config.ordered_object_class
+            result.object_layer_valid |= semantic_layer
         foreground = result.base_valid & (result.base_labels > 0)
         overlap = (prediction.labels > 0) & foreground
         prediction.diagnostics['foreground_conflict_pixels'] = int(overlap.sum())
@@ -31,6 +38,13 @@ class PredictionFusionStep:
         result.mapped_labels[positive] = prediction.labels[positive]
         result.object_identities = np.where(positive, prediction.identities, 0).astype(np.uint16)
         result.object_valid = prediction.valid
+        if (prediction.semantic_foreground is not None and config is not None
+                and config.ordered_object_class is not None):
+            # Layouts may agree on class foreground while disagreeing on cyclic identity.
+            semantic = prediction.semantic_foreground & ~foreground & inputs.target_roi
+            result.mapped_labels[semantic] = config.ordered_object_class
+            prediction.diagnostics['semantic_consensus_added_pixels'] = int(semantic.sum())
+            positive |= semantic
         # Periodic background alone cannot prove that the instance class is absent.
         result.label_valid = ((result.label_valid & prediction.valid)
                               | positive | foreground) & inputs.target_roi

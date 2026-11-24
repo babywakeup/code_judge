@@ -27,15 +27,17 @@ def translation_peaks(source: Array, target: Array, sm: Mask, tm: Mask,
     if not sm.any() or not tm.any():
         return []
 
-    def correlate(image: Array, kernel: Array) -> Array:
-        padded = cv2.copyMakeBorder(image, sh - 1, sh - 1, sw - 1, sw - 1,
-                                    cv2.BORDER_CONSTANT, value=0)
-        return cv2.matchTemplate(padded, kernel, cv2.TM_CCORR)
+    def pad(image: Array) -> Array:
+        return cv2.copyMakeBorder(image, sh - 1, sh - 1, sw - 1, sw - 1,
+                                  cv2.BORDER_CONSTANT, value=0)
 
-    overlap = np.rint(np.maximum(correlate(tm, sm), 0))
-    numerator = correlate(target, source)
-    energy_target = np.maximum(correlate(target * target, sm), 0)
-    energy_source = np.maximum(correlate(tm, source * source), 0)
+    # The target ROI is used twice. Retain the same padded canvas and OpenCV
+    # correlation calls (including rounding), rather than changing the solver.
+    padded_mask = pad(tm)
+    overlap = np.rint(np.maximum(cv2.matchTemplate(padded_mask, sm, cv2.TM_CCORR), 0))
+    numerator = cv2.matchTemplate(pad(target), source, cv2.TM_CCORR)
+    energy_target = np.maximum(cv2.matchTemplate(pad(target * target), sm, cv2.TM_CCORR), 0)
+    energy_source = np.maximum(cv2.matchTemplate(padded_mask, source * source, cv2.TM_CCORR), 0)
     energy = energy_target * energy_source
     coverage = overlap / float(tm.sum())
     eligible = ((coverage >= cfg.min_overlap)

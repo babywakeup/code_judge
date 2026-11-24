@@ -103,6 +103,11 @@ class PartialCycleTests(unittest.TestCase):
             a, np.ones(a.shape, np.uint8), [np.eye(3)]*2, self.cfg())
         self.assertEqual(result.diagnostics['status'], 'ambiguous_identity')
         self.assertFalse(result.identities.any())
+        self.assertFalse(result.valid.any())
+        expected = np.zeros_like(a, dtype=bool)
+        for x in (26, 106, 186):
+            expected[:, x:x+28] = True
+        np.testing.assert_array_equal(result.semantic_foreground, expected)
 
     def test_array_api_rejects_noncontiguous_and_duplicate_reference_identities(self):
         source, refs, _ = scene('ABC')

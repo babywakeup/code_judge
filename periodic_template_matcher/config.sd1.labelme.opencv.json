@@ -1,7 +1,6 @@
 {
-  "target": "../source/SD-1/imgs/TNXPB1/18851_AFE55CS01DA_TDAOI810_59_141.122_-880.633_O_M_20260124_111649.jpg",
-  
-  "target_valid_height": 1891,
+  "target": "../source/SD-1/imgs/TNXFL0/18851_AFE55CN01MA_TDAOI810_42_-625.130_66.034_O_M_20260119_124238.jpg",  
+
   "templates": [
     {
       "name": "SD1_1258237",
@@ -11,7 +10,6 @@
           "order": ["A", "B", "C"]
         }
       },
-      "valid_height": 1891,
       "image": "../source/SD-1/templates2/18851_AFE568N05MA_TDAOI520_75_-332.651_-750.175_O_S_20260921_084833.jpg",
       "labelme": "../source/SD-1/templates2/18851_AFE568N05MA_TDAOI520_75_-332.651_-750.175_O_S_20260921_084833.json",
       "class_map": {
@@ -27,7 +25,6 @@
           "order": ["D", "A", "B"]
         }
       },
-      "valid_height": 1891,
       "image": "../source/SD-1/templates2/18851_AFE568N05UA_TDAOI520_340_-192.681_-455.144_O_S_20260921_082643.jpg",
       "labelme": "../source/SD-1/templates2/18851_AFE568N05UA_TDAOI520_340_-192.681_-455.144_O_S_20260921_082643.json",
       "class_map": {
@@ -51,21 +48,26 @@
           "cycle": ["A", "B", "C", "D"],
           "visible_count": 3,
           "min_score": 0.7,
-          "min_gap": 0.02,
+          "min_gap": 0.0,
           "min_visible": 0.15,
           "spacing_weight": 0.3
         }
       }
     },
     "step1": {
-      "description": "预处理：设置有效区域，统一缩放模板和输入图像；scale 为 null 时根据 max_side 自动计算倍率。",
-      "max_side": 800,
+      "description": "预处理：先裁剪模板与输入图像的公共有效区域，再统一缩放。边界采用原图坐标，包含起点，不包含终点。",
+      "valid_x_start": 0,
+      "valid_x_end": null,
+      "valid_y_start": 0,
+      "valid_y_end": 1891,
+      "max_side": 640,
       "scale": null
     },
     "step2": {
       "description": "粗匹配：在缩放后的图像上枚举模板的 angles 和 scales 组合，搜索平移位置并生成候选。",
       "backend": "opencv",
       "template_workers": 0,
+      "peaks_per_hypothesis": 3,
       "angles": [
         0
       ],
@@ -79,11 +81,15 @@
       "min_score": 60,
       "min_template_gap": 1,
       "refine_candidates": 8,
-      "ecc_iterations": 70
+      "ecc_iterations": 70,
+      "ecc_roi": true
     },
     "periodic": {
       "description": "启用周期补全，方向权限由classes中各类别的repeat_axes声明；周期像素距离独立自动估计，保留已有前景和白色缺陷下的标签迁移。",
-      "periodic_completion": true
+      "periodic_completion": true,
+      "shared_periods": true,
+      "periodic_max_steps": 1,
+      "periodic_min_ncc": 0.72
     }
   }
 }

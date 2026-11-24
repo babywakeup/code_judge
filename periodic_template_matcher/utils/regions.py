@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import cv2
@@ -14,18 +13,18 @@ from .types import Diagnostics, Image, Mask, Size
 
 @dataclass(frozen=True)
 class ValidRegion:
-    """Valid top rows [0, valid_height), intersected with an optional image mask.
-
-    Height is in original-image pixels; None keeps the full image height.
-    The full-size mask preserves image coordinates, labels and output dimensions.
-    """
+    """An axis-aligned, half-open rectangle in original image pixels."""
 
     valid_height: int | None = None
+    x_start: int = 0
+    x_end: int | None = None
+    y_start: int = 0
 
     @classmethod
     def from_config(cls, config: MatcherConfig, valid_height: int | None = None) -> ValidRegion:
-        height = config.valid_height if valid_height is None else valid_height
-        return cls(height)
+        end = config.valid_y_end if config.valid_y_end is not None else config.valid_height
+        height = end if valid_height is None else valid_height
+        return cls(height, config.valid_x_start, config.valid_x_end, config.valid_y_start)
 
     def resolved_height(self, image: Image) -> int:
         if not isinstance(image, np.ndarray) or image.ndim not in (2, 3) or min(image.shape[:2]) < 1:
@@ -37,23 +36,35 @@ class ValidRegion:
             return self.valid_height
         return height
 
+    def slices(self, image: Image) -> tuple[slice, slice]:
+        y_end = self.resolved_height(image)
+        width = image.shape[1]
+        x_end = width if self.x_end is None else self.x_end
+        if (type(self.x_start) is not int or type(x_end) is not int
+                or not 0 <= self.x_start < x_end <= width):
+            raise ValueError(f'Expected 0 <= valid_x_start < valid_x_end <= {width}')
+        if type(self.y_start) is not int or not 0 <= self.y_start < y_end:
+            raise ValueError('Expected 0 <= valid_y_start < the resolved valid y end')
+        return slice(self.y_start, y_end), slice(self.x_start, x_end)
+
     def build_mask(self, image: Image, mask: Mask | None = None) -> Mask:
         """Return a new HxW uint8 image ROI, never annotation knowledge."""
-        end = self.resolved_height(image)
-        if mask is None:
-            out = np.ones(image.shape[:2], np.uint8)
-        else:
-            if not isinstance(mask, np.ndarray) or mask.shape != image.shape[:2]:
-                raise ValueError('Valid-mask size must match image height and width')
-            out = (mask > 0).astype(np.uint8)
-        out[end:] = 0
-        if out.sum() < 1024:
+        region = self.slices(image)
+        if mask is not None and (not isinstance(mask, np.ndarray) or mask.shape != image.shape[:2]):
+            raise ValueError('Valid-mask size must match image height and width')
+        cropped = (np.ones(image[region].shape[:2], np.uint8) if mask is None
+                   else (mask[region] > 0).astype(np.uint8))
+        if cropped.sum() < 1024:
             raise ValueError('Too few valid image pixels')
+        if cropped.shape == image.shape[:2]:
+            return cropped
+        out = np.zeros(image.shape[:2], np.uint8)
+        out[region] = cropped
         return out
 
     def crop(self, image: Image) -> Image:
-        """Return a top-row image copy; optional convenience for external callers."""
-        return image[:self.resolved_height(image)].copy()
+        """Return a copy of the valid rectangle."""
+        return image[self.slices(image)].copy()
 
     @staticmethod
     def resize_for_matching(gray: Image, mask: Mask, size: Size) -> tuple[Image, Mask]:
@@ -74,6 +85,10 @@ class ValidRegion:
 
     def describe(self, image: Image, mask: Mask) -> Diagnostics:
         """JSON-safe record of the resolved image region, including mask holes."""
-        return dict(image_height=int(image.shape[0]), image_width=int(image.shape[1]),
-                    valid_height=self.resolved_height(image), valid_pixels=int(mask.sum()),
+        ys, xs = self.slices(image)
+        info = dict(image_height=int(image.shape[0]), image_width=int(image.shape[1]),
+                    valid_height=ys.stop, valid_pixels=int(mask.sum()),
                     height_source='explicit' if self.valid_height is not None else 'full_image')
+        if (ys.start, ys.stop, xs.start, xs.stop) != (0, image.shape[0], 0, image.shape[1]):
+            info['valid_bounds'] = dict(x_start=xs.start, x_end=xs.stop, y_start=ys.start, y_end=ys.stop)
+        return info

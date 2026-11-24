@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>AOI · 匹配工作台</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="AOI 匹配工作台首页"><span class="brand-mark" aria-hidden="true">◈</span><span><strong>AOI 匹配工作台</strong><small>PERIODIC MATCHER / 图像验收图库</small></span></a>
+    <div class="header-stats" aria-label="数据概览">
+      <div><span>图像总量</span><strong id="statTotal">—</strong></div>
+      <div><span>匹配通过</span><strong id="statAvailable">—</strong></div>
+      <div><span>待运行</span><strong id="statPending">—</strong></div>
+      <div><span>未通过 / 异常</span><strong id="statIssues">—</strong></div>
+    </div>
+    <div class="header-actions"><span id="connection" class="connection">连接中</span><button id="refresh" class="button dark" type="button">↻ 重新扫描</button></div>
+  </header>
+
+  <div class="app-shell">
+    <aside id="filterPane" class="filter-pane" aria-label="图库筛选">
+      <div class="pane-heading"><span>筛选图像 <small id="filterCount">0</small></span><button id="resetFilters" class="text-button" type="button">重置</button></div>
+      <form id="filterForm" autocomplete="off">
+        <label class="field">搜索名称 / 路径<input name="q" id="q" type="search" placeholder="搜索图像、文件路径…"></label>
+        <label class="field">数据分组<select name="group" id="group"><option value="">全部分组</option></select></label>
+        <label class="field">匹配验收状态<select name="status" id="status"><option value="">全部状态</option><option value="pending">待匹配</option><option value="running">匹配中</option><option value="available">匹配通过</option><option value="rejected">匹配未通过</option><option value="no_annotations">无标注</option><option value="error">运行异常</option></select></label>
+        <label class="field">匹配模板<select name="template" id="template"><option value="">全部模板</option></select></label>
+        <div class="field-pair"><label class="field">工位<select name="station" id="station"><option value="">全部工位</option></select></label><label class="field">严重度<select name="severity" id="severity"><option value="">全部严重度</option></select></label></div>
+        <fieldset><legend>采集日期</legend><label class="field compact">从<input name="date_from" id="date_from" type="date"></label><label class="field compact">至<input name="date_to" id="date_to" type="date"></label></fieldset>
+        <label class="field">最低匹配分数<input name="min_score" id="min_score" type="number" step="any" placeholder="不限（按后端分数量纲）"></label>
+        <label class="field">排序方式<select name="sort" id="sort"><option value="key">文件名 / 路径</option><option value="score_desc">匹配分数 · 从高到低</option><option value="score_asc">匹配分数 · 从低到高</option></select></label>
+      </form>
+      <section class="status-legend"><h2>匹配状态概览</h2><div id="statusCounts"></div><p>“通过 / 未通过”仅表示模板匹配验收结果，<strong>不代表有无缺陷</strong>。严重度为数据标签。</p></section>
+      <div class="pane-foot"><span class="tiny-dot"></span> 本地预览 · 原始图像不被修改</div>
+    </aside>
+
+    <main class="workspace">
+      <div class="workspace-heading"><div><div class="eyebrow">INSPECTION LIBRARY</div><h1>图像匹配图库 <span id="filteredTotal">—</span></h1><p>快速浏览原图、分割与周期补全，逐张核验匹配结果。</p></div><button id="toggleFilters" class="button mobile-only" type="button" aria-expanded="false" aria-controls="filterPane">☷ 筛选</button></div>
+      <section class="job-panel" aria-label="匹配任务">
+        <div class="job-line"><div><span id="jobDot" class="job-dot"></span><strong id="jobTitle">暂无运行任务</strong><span id="jobProgressText" class="muted"></span></div><button id="stopJob" class="button danger small" type="button" title="停止后不再启动排队图像，等待当前所有处理中图像完成" disabled>停止（等待所有处理中图像完成）</button></div>
+        <progress id="jobProgress" max="1" value="0" aria-label="任务进度"></progress>
+        <div class="job-bottom"><span id="jobCurrent">可按当前页或全部筛选结果启动匹配</span><span id="jobErrors"></span></div>
+      </section>
+      <div id="errorBanner" class="error-banner" role="alert" hidden><span id="errorText"></span><button id="retry" class="button small" type="button">重试连接</button><button id="dismissError" class="icon-button" type="button" aria-label="关闭错误提示">×</button></div>
+      <section class="action-bar" aria-label="批量操作">
+        <div class="selection-actions"><label class="check"><input id="selectPage" type="checkbox">选择本页</label><span id="selectionCount" class="selection-count">未选择</span><button id="clearSelection" class="text-button" type="button" disabled>清空</button></div>
+        <div class="run-actions"><label class="check"><input id="skipCompleted" type="checkbox" checked>跳过当前配置的已完成结果</label><button id="runPage" class="button" type="button" disabled>▶ 匹配本页</button><button id="runFiltered" class="button primary" type="button" disabled>▶ 匹配全部筛选</button></div>
+      </section>
+      <section class="view-bar" aria-label="预览设置">
+        <div class="mode-buttons" role="group" aria-label="预览模式"><button data-mode="input" type="button" aria-pressed="false">原图</button><button data-mode="overlay" type="button" aria-pressed="true">叠加</button><button data-mode="mask" type="button" aria-pressed="false">掩膜</button><button data-mode="split" type="button" aria-pressed="false">对照</button></div>
+        <label class="inline-field">图层<select id="source"><option value="all">全部来源（重叠混色）</option><option value="fused">最终互斥标签</option><option value="direct">直接匹配</option><option value="periodic">周期补全</option><option value="objects">对象补全</option></select></label>
+        <label class="alpha-control">透明度 <input id="alpha" type="range" min="0" max="1" step="0.05" value="0.5"><output id="alphaValue" for="alpha">50%</output></label>
+        <label class="check"><input id="unknown" type="checkbox" checked>未知区域</label>
+        <div class="density-controls"><label class="inline-field">每页<select id="pageSize"><option value="40">40</option><option value="80" selected>80</option><option value="120">120</option><option value="200">200</option></select></label><label class="inline-field">列数<select id="columns"><option value="4">4</option><option value="5" selected>5</option><option value="6">6</option><option value="8">8</option></select></label></div>
+      </section>
+      <div class="gallery-heading"><span id="rangeInfo">正在读取图像…</span><span id="loadingLabel" role="status" aria-live="polite"></span><span class="muted">点击图像查看详情 · 未运行图像自动显示原图</span></div>
+      <div id="gallery" class="gallery" style="--columns:5" aria-label="图像图库" aria-busy="true"></div>
+      <div id="emptyState" class="empty-state" hidden><span aria-hidden="true">▧</span><h2 id="emptyTitle">没有符合条件的图像</h2><p id="emptyText">调整筛选条件，或重新扫描数据目录。</p><button id="emptyReset" class="button" type="button">重置筛选</button></div>
+      <footer class="pagination"><span id="pageInfo">第 1 / 1 页</span><nav aria-label="图库分页"><button id="pagePrev" class="button small" type="button" disabled>← 上一页</button><label>跳至 <input id="pageInput" type="number" min="1" value="1" aria-label="目标页码"> 页</label><button id="pageGo" class="button small" type="button">前往</button><button id="pageNext" class="button small" type="button" disabled>下一页 →</button></nav><span class="muted">缩略图按需加载</span></footer>
+    </main>
+  </div>
+
+  <dialog id="detailModal" aria-labelledby="detailTitle">
+    <div class="detail-heading"><div><span class="eyebrow">MATCH INSPECTOR</span><h2 id="detailTitle">图像详情</h2><span id="detailPosition" class="muted"></span></div><div class="detail-nav"><button id="detailPrev" class="button small" type="button" aria-label="上一张">←</button><button id="detailNext" class="button small" type="button" aria-label="下一张">→</button><button id="closeDetail" class="icon-button" type="button" aria-label="关闭详情">×</button></div></div>
+    <div class="detail-toolbar">
+      <div class="mode-buttons" role="group" aria-label="详情预览模式"><button data-mode="input" type="button" aria-pressed="false">原图</button><button data-mode="overlay" type="button" aria-pressed="true">叠加</button><button data-mode="mask" type="button" aria-pressed="false">掩膜</button><button data-mode="split" type="button" aria-pressed="false">对照</button></div>
+      <label class="inline-field">图层<select id="detailSource"><option value="all">全部来源（重叠混色）</option><option value="fused">最终互斥标签</option><option value="direct">直接匹配</option><option value="periodic">周期补全</option><option value="objects">对象补全</option></select></label>
+      <label class="alpha-control">透明度 <input id="detailAlpha" type="range" min="0" max="1" step="0.05" value="0.5"><output id="detailAlphaValue" for="detailAlpha">50%</output></label>
+      <label class="check"><input id="detailUnknown" type="checkbox" checked>未知区域</label><button id="detailZoom" class="button small" type="button" aria-pressed="false">高清放大 · 1920px</button>
+    </div>
+    <div class="detail-body"><section class="detail-renderer"><div class="render-caption"><span id="renderCaption">预览</span><span>对照模式由服务端并排渲染 · 放大后可拖动 / 滚动</span></div><div id="detailStage" class="detail-stage"><div id="detailImageWrap" class="detail-image-wrap"></div></div><div id="detailNotice" class="detail-notice" role="status">正在读取详情…</div></section><aside class="detail-inspector"><div id="detailStatus"></div><div id="detailStats" class="detail-stats"></div><h3>类别像素统计</h3><div id="classStats" class="class-stats"></div><h3>可下载文件</h3><div id="downloads" class="downloads"></div><p class="muted small-copy">仅显示清单声明的下载文件，不直接访问磁盘路径。</p><details id="metadataDetails"><summary>完整元数据 / 结果 JSON</summary><pre id="metadataJson"></pre></details><div id="resultPath" class="result-path"></div></aside></div>
+    <div class="detail-footer"><span>← → 仅切换当前页 · Esc 关闭</span><span>匹配验收 ≠ 缺陷判定</span></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <noscript>此工作台需要启用 JavaScript 才能筛选图库与启动匹配任务。</noscript>
+</body>
+</html>

@@ -1,7 +1,7 @@
 """Step 2: select a source and expose direct image geometry, not labels."""
 
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict
 
 import cv2
 import numpy as np
@@ -25,7 +25,7 @@ class RegistrationStep:
 
     def run(self, inputs: PreparedInputs, config: MatcherConfig) -> RegisteredMatch:
         # InputPreparationStep resolved heights already. Do not exclude rows twice.
-        registration_config = replace(config, valid_height=None)
+        registration_config = config.without_valid_region()
         registration = self.selector(inputs.templates, inputs.target, registration_config,
                                      inputs.template_valids, inputs.target_valid, config.label_mode)
         registration.update(config=asdict(config), valid_regions=inputs.regions)

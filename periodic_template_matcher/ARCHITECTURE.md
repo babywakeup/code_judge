@@ -3,15 +3,20 @@
 ## 1. 先看哪里
 
 - **调用 API**：[matcher.py](matcher.py) 的 `PeriodicTemplateMatcher`。
-  只负责配置副本、组装依赖和调用推理/评价，不再容纳各步骤的业务实现。
+  持有配置和预处理后的输入，组装各个推理步骤，对外提供文件推理、数组推理、评价和导出。
 - **查看执行顺序**：[_internal/pipeline.py](_internal/pipeline.py) 的 `MatchPipeline.run()`。
   不使用动态注册器或隐藏的 Step 调度，直接列出执行顺序与提前返回条件。
 - **查看某一步实现**：按功能进入下表中的配准、实例或分割目录，Step 与对应算法放在一起。
 - **查看数值计算**：Step 调用已有算法函数，见下表。纯计算函数保持为函数，
   不为了“全部变成类”额外增加继承或包装层。
-- **JSON / 文件入口**：[_internal/io/workflow.py](_internal/io/workflow.py) 的 `run_config()`。
-  负责路径解析、模板文件去重、图像/标注读取、输出元信息和输入覆盖保护；
-  真正推理仍调用同一个数组 API，不引入第二套推理实现。
+- **JSON / 文件入口**：[_internal/io/workflow.py](_internal/io/workflow.py) 的 `InferenceFiles`
+  负责路径解析、模板去重、读取图像与标注、附加输出元信息和检查输出路径。
+  `run_config()` 创建 Matcher 并调用 `infer_to()`。文件与数组入口都执行 `MatchPipeline`。
+
+用 JSON 路径创建 Matcher 时，初始化会读取模板、标注、有效掩膜及默认目标，
+并准备配准特征、默认目标的周期晶格和 ECC 金字塔。
+传入其他目标路径时，只读取新目标。模板配准特征保留初始化倍率和最近一次其他倍率的结果。
+已初始化的文件 Matcher 使用创建时的配置快照。配置或模板变更后创建新实例。
 
 ### 目录按功能归组，不再平铺算法或另外维护 steps 目录
 
@@ -37,6 +42,7 @@
 | [objects/matching.py](_internal/objects/matching.py) | 组织对象候选生成、布局选择和预测输出 |
 | [objects/appearance.py](_internal/objects/appearance.py) | 在真实可见交集上搜索对象外观相关峰 |
 | [objects/layout.py](_internal/objects/layout.py) | 候选质量、参考间距估计、循环身份顺序求解 |
+| [segmentation/instances.py](_internal/segmentation/instances.py) | 融合后独立验收已知背景中的周期语义小实例；保护全部既有前景 |
 
 `core` 与 `matching` 保留原有辅助函数的导入入口；函数实现只存在于对应职责模块中。
 周期分割与对象补全直接复用 `scoring`，不通过配准搜索流程访问评分算法。
@@ -68,15 +74,19 @@ flowchart TD
     Accepted -- 是 --> Transfer[4 LabelTransferStep]
     Transfer --> Periodic[5 PeriodicCompletionStep]
     Periodic --> Located{启用了独立实例分支?}
-    Located -- 否 --> Return
+    Located -- 否 --> Interior[8 Verified periodic semantic instances]
     Located -- 是 --> Support[6 ObjectSupportCompletionStep]
     Support --> Fusion[7 PredictionFusionStep]
-    Fusion --> Return
+    Fusion --> Interior
+    Interior --> Return
 ```
 
 注意：步骤 3 必须在“匹配是否接受”的最终判断之前执行。只有模板分数接近
 （`templates_too_close`）时，强实例证据才可能解除模板选择歧义；它不能把普通低分匹配改成接受。
 步骤 6 必须在步骤 5 后面，因为它依赖基础周期分支验证过的几何关系。
+最后的可选语义轮廓补全仅在共享且已验证晶格下执行，必须位于融合后：冻结最终已有轮廓
+作为来源，拒绝与任何已有前景重叠的目标，避免重新引入 base 错相位或覆盖已确认身份。
+该小型算法直接以具名函数调用，不增加只有转发作用的 Step 包装类。
 
 ## 3. 每个功能所属的类
 
@@ -89,6 +99,7 @@ flowchart TD
 | 5 `PeriodicCompletionStep` | 控制仅在启用且为 semantic 时进行基础周期补全 | 身份支持补全、最终结果融合 | [步骤实现](_internal/segmentation/transfer.py) → [periodic.py](_internal/segmentation/periodic.py) 的 `complete_periodic()` |
 | 6 `ObjectSupportCompletionStep` | 筛选已批准的晶格几何，把源周期向量换算到目标原图坐标，补全已定位身份的支持 | 无证据生成身份、沿排列轴复制实例 | [步骤实现](_internal/objects/steps.py) → [completion.py](_internal/objects/completion.py) 的 `complete_object_support()` |
 | 7 `PredictionFusionStep` | 保存基础预测快照、保护基础前景、融合实例及身份图、协调未知区域与最终覆盖统计 | 再次匹配、修改阈值 | [fusion.py](_internal/objects/fusion.py) |
+| 8 `complete_periodic_instances()` | 冻结完整非身份轮廓，以同图周期对应区的独立像素及结构/边缘证据补已知空背景 | 覆盖已有前景、传播身份、认证未知、修改健康模板、增添 ECC 或自举 | [instances.py](_internal/segmentation/instances.py) |
 | 可选 `SegmentationEvaluationStep` | 校验 GT 与评价 ROI，对最终结果计算指标，处理拒绝/无标注情况 | 用 GT 指导任何推理步骤 | [evaluation.py](_internal/segmentation/evaluation.py)，同模块定义 `evaluate_segmentation()` |
 | `MatchPipeline` | 控制顺序、分支和提前返回；持有每个 Step | IO、数值匹配、评价 | [pipeline.py](_internal/pipeline.py) |
 
@@ -148,8 +159,13 @@ flowchart TD
 5. **融合优先级**：完整周期模式保护基础前景；显式局部周期模式下，已验证身份的实例前景优先，
    防止基础周期错相位切掉实例分叉。原基础标签保留在快照中，冲突与覆盖计数分别为
    `foreground_conflict_pixels`、`instance_priority_pixels`。未知身份不覆盖基础前景。
+  最终单通道优先级不影响独立来源：`direct_labels/direct_valid` 在移除独立匹配的 ordered 类之后保存，
+  `completion_labels/completion_valid` 在融合前保存并追加后续已验收补全，
+  `object_labels/object_layer_valid/object_layer_identities` 保留未被优先级裁剪的对象证据。
+  来源之间允许重叠，查看器不能用最终互斥标签反推这些层；GT 评价仍针对原最终预测。
 6. **基础快照包含基础周期补全**：`base_labels` / `base_valid` 是实例融合前的基础输出，
-   不是仅直接配准的结果。`warped_template` / `geometric_valid` 才描述直接几何。
+  不是仅直接配准的结果，也不包含融合后的独立语义轮廓补全。
+  `warped_template` / `geometric_valid` 才描述直接几何。
 7. **评价与推理解耦**：GT 只进入 `SegmentationEvaluationStep`，不会进入配准或补全。
 
 ## 6. 修改功能时找哪里

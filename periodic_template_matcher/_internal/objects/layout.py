@@ -9,7 +9,7 @@ from typing import Any, TypeAlias
 
 import numpy as np
 
-from ...utils.types import Image, Matrix
+from ...utils.types import BoolMask, Image, Matrix
 
 
 Candidate: TypeAlias = dict[str, Any]
@@ -78,6 +78,28 @@ def solve_layout(pools: CandidatePools, cycle: list[str], spacing: Spacing,
     return sorted(groups, key=lambda g: g[0], reverse=True)
 
 
+def shared_foreground(groups: Sequence[Layout], min_gap: float) -> BoolMask:
+    """Keep only coordinates marked foreground by every layout within the margin."""
+    best_score, _, best = groups[0]
+    common = np.zeros_like(best[0]['_mask'])
+    current = np.empty_like(common)
+    for candidate in best:
+        common |= candidate['_mask']
+    for score, _, candidates in groups[1:]:
+        if best_score - score >= min_gap:
+            break
+        current.fill(False)
+        for candidate in candidates:
+            current |= candidate['_mask']
+        common &= current
+    return common
+
+
+def is_partial_reference(ref: Candidate, left: int, right: int, width: int) -> bool:
+    start, end = ref.get('_order_axis_bounds', (0, width))
+    return left < start + 2 or right >= end - 2
+
+
 def _template_spacings(
     images: Sequence[Image], references: Sequence[Sequence[Candidate]],
     matrices: Sequence[Matrix | Sequence[Sequence[float]] | None], cycle: Sequence[str],
@@ -94,7 +116,7 @@ def _template_spacings(
                 continue
             # A source-edge fragment has a biased center; use a complete reference
             # from another template rather than learning that bias as a spacing.
-            if xx.min() < 2 or xx.max() >= image.shape[1]-2:
+            if is_partial_reference(ref, int(xx.min()), int(xx.max()), image.shape[1]):
                 continue
             p = np.array([(xx.min()+xx.max())/2, (yy.min()+yy.max())/2, 1.])
             centers.append((p[0], ref['identity'], float((np.asarray(H) @ p)[0])))

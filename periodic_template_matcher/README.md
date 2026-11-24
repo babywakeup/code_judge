@@ -105,48 +105,53 @@ class 1 仍由基础语义分支处理。如果基础配准被拒绝，但局部
 当前 OpenCV 示例配置使用 templates2 中已明确身份的 ABC、DAB 两张模板。
 新增模板需显式配置其实际顺序；仅把文件放进目录不会自动启用。
 
-## 匹配前设置有效高度
+### 640 下的同身份轮廓补全
 
-模板和 input 的底部文字可以通过原图像素高度排除：
+开启 `shared_periods` 后，普通副本未能补齐时，从已确认的同身份
+`supporting_references` 重选画布内周期原点，不再只依赖靠近边缘的主变换。
+只对晶格所属模板提出周期一致仿射约束，保留真实观测中心并限制在六个工作像素内；
+候选仍需区域外观验证，不跨身份、跨源借用矩阵或扩展截断参考的未知横向范围。
+
+外观异常截断连续源轮廓时，允许用同一轮廓上下独立通过像素 NCC、结构和边缘门槛的
+同身份证据桥接中间前景；未验收的间隔受配置周期预算限制，不推断背景，不从新桥接
+像素继续自举。没有两端证据的边界或整段遮挡仍保持未知。
+所有匹配特征与 ECC 继续使用 `max_side=640`，无 800 回退、无新增图片并行。
+新增空间诊断使用原图半开 `target_bbox`，同时记录真实源模板索引。
+问题图的前后叠加、串行测量及非 GT 证据边界见
+[性能与验证记录](../docs/single_image_performance.md)。
+
+## 匹配前裁剪有效区域
+
+在 `options.step1` 中给 target 和模板设置共同的原图像素边界：
 
 ```json
 {
-  "target": "input.jpeg",
-  "target_valid_height": 1891,
-  "templates": [
-    {"image": "template_A.jpeg", "valid_height": 1891},
-    {"image": "template_B.jpeg", "valid_height": 1850}
-  ],
-  "options": {"valid_height": 1891}
+  "options": {
+    "step1": {
+      "valid_x_start": 0,
+      "valid_x_end": null,
+      "valid_y_start": 0,
+      "valid_y_end": 1891
+    }
+  }
 }
 ```
 
-H=1891 表示有效行是 `[0, 1891)`，第 1891 行及之后不参与匹配。
-优先级为：每张图的显式高度 > `options.valid_height` 公共默认高度 > 整张图像。
-所有情况仍与已有图像 mask 取交集，不再支持按底部比例裁剪。
-高度必须为正整数且不超过对应图像高度，有效像素不足时会明确报错。
+起点包含在有效区内，终点排除。起点默认是 `0`，终点为 `null` 时取图像相应边界。
+Y 终点优先级为每张图的显式高度（`target_valid_height` 或模板的 `valid_height`）、
+公共 `valid_y_end`、公共 `valid_height`、图像底部。
+边界必须落在图像尺寸内。裁剪后仍与已有图像有效区掩膜取交集，标注有效范围单独处理。
 
-实现集中在 `utils/regions.py` 的 `ValidRegion` 类中：
-
-- `resolved_height(image)`：解析有效 H。
-- `build_mask(image, mask=None)`：构造原图大小的 0/1 mask，与额外 mask 取交集。
-- `resize_for_matching(gray, mask, size)`：仅用有效像素加权缩小，避免文字在缩放边界混入。
-- `crop(image)`：可选的外部裁切便利方法；正式 matcher 保留原图画布和坐标。
-- `describe(image, mask)`：生成可检查的高度和有效像素统计。
-
-`InputPreparationStep.prepare_regions()` 在提取特征前统一解析图像 ROI，之后复用于配准、
-标签迁移和周期补齐；评价复用同一 `ValidRegion` 策略。Matcher 的 `_prepare_regions()`
-仅保留为兼容委派。标注有效范围 `annotation_valid` 与图像有效范围分别处理。
-输出图像和 mask 保持原始 input 尺寸；无效底部的 `label_valid` 始终为 0。
-`result.json.valid_regions` 和 HTML 报告会记录每张图的最终有效 H。
+设置矩形边界后，Python Matcher 使用裁剪后的图像、掩膜和标注做缩放、配准及补全。
+仅使用旧版 `valid_height` 参数的调用继续使用原图大小的有效掩膜。
+输出填回原图尺寸，
+矩形之外的预测掩膜与有效性为零。变换矩阵和对象中心使用原图坐标。
+`result.json.valid_regions` 记录每张图的有效边界。
 
 ```python
 from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher
-from periodic_template_matcher.utils import ValidRegion
-
-region = ValidRegion(valid_height=1891)
-valid_mask = region.build_mask(image)
-matcher = PeriodicTemplateMatcher(MatcherConfig(valid_height=1891))
+matcher = PeriodicTemplateMatcher(MatcherConfig(valid_y_end=1891))
+cropped = matcher.get_valid(input_image)
 result = matcher.match(
     templates, labels, input_image,
     template_valid_heights=[1891, 1850],
@@ -175,10 +180,49 @@ SD-1 的两份 LabelMe 配置已经启用；通用 API 默认关闭，以保留�
 若同一个周期前景连通区域横跨未知区与直接配准区，会将其在背景 0 上的部分一并补齐，避免物体被配准边界截断；完全位于直接区域内的其他物体不会因此扩张。
 `periodic_max_steps` 默认 2（范围 1..5），限定每个周期方向的复制步数，避免无界搜索。
 
+可选 `options.periodic.shared_periods: true`（通用默认 `false`，SD-1 OpenCV 配置已开启）：
+将模板自平移、目标自平移及同身份/同参考的出现间距联合校验为源/目标周期向量，可靠格点
+共享几何，不再逐副本仿射 ECC；不可靠轴回退上述原路径。类权限仍按源轴检查，目标倾斜不
+改变重复方向。对象支持按同身份/同参考复用残差平移，所有新增区域仍独立验收自身证据。
+这是允许标签变化的算法选项，不保证旧输出逐位相同，也尚未在 C++ 内核实现；详见
+[性能与差异说明](../docs/single_image_performance.md)。
+
+共享模式还会在实例融合后检查**完全位于已知背景中的独立语义实例**，弥补上述未知种子
+策略无法覆盖的漏项。只从融合后已经存在、周围标注有效且未被其他类别遮挡的完整轮廓出发，
+按已验证晶格与类别源轴权限，在配置步数内提出同图周期对应。每个新轮廓须以原分辨率
+离散像素 NCC、640 等既有工作分辨率的局部结构 NCC 和对称边缘评分独立通过原阈值。
+只写已知空背景；不覆盖任何旧前景、身份或未知区域，不新增 ECC，不以新补结果继续播种。
+相同目标的多个别名只选自身像素证据最强且通过结构/边缘验证的一份，不叠加扩大轮廓。
+该路径不复制独立身份类别，不改变已验证实例纠正 base 相位的既有优先级。
+`periodic_completion.interior_instances` 记录新增像素、源轮廓的 `source_target_bbox`、
+目标 `target_bbox`、偏移、周期向量及评分；两个框均为目标原图坐标下的半开范围。
+它只补标签，不把目标实测图像冒充健康模板，也不更改 `completed_template`。
+
 API 的 `mapped_labels` / `label_valid` 为最终预测；`geometric_valid` / `warped_template`
 仍是直接配准。新增 `completed_template`、`completed_valid`、`periodic_valid`、
 `label_periodic_valid` 分别表示补齐图像、补齐几何范围、图像补齐区和标签补齐区。
 未执行周期补齐时这些新增字段为 None。仅在 semantic 模式补齐，不复制唯一实例编号。
+
+### 独立保留各阶段掩膜（允许重叠）
+
+单通道 `mapped_labels` 每个像素只能容纳一个类别；已验证实例纠正 base 相位时，
+最终 label=2 可能覆盖直接迁移的 label=1。现在另外保留以下互不覆盖的来源证据：
+
+| API 字段 | 保存内容 |
+| --- | --- |
+| `direct_labels` / `direct_valid` | 直接语义匹配标签；启用独立对象分支时，先移除对应类别（当前配置为 label=2），再变换并保存 |
+| `completion_labels` / `completion_valid` | 已验收周期补全，融合之前保存；也包含融合后通过验证的独立小实例补全 |
+| `object_labels` / `object_layer_valid` | 独立对象前景，不因基础前景保护或最终优先级而删除 |
+| `object_layer_identities` | 独立对象层身份；语义一致但身份不明的前景保持身份 0 |
+
+这些字段均为目标原图尺寸，各自携带 validity，输出为同名 PNG。三个来源的同一位置
+可以同时保留类别 1 和类别 2；它们是多份匹配假设，不表示冲突双方必然都正确。
+启用对象分支时，label=2 只来自对象层，不从直接层或语义补全层引入未经独立定位的模板投影。
+类别边界由 `ordered_object_class` 决定，并非硬编码为 2；未启用对象分支的纯语义模式不排除类别。
+旧 `mapped_labels`、`label_valid`、身份字段和最终优先级不变，评价仍使用最终互斥标签。
+不要再通过“最终标签减去对象/周期区域”反推直接匹配掩膜；那会不可逆地丢失重叠信息。
+查看器默认“全部来源（重叠混色）”，可单独看三层或切换“最终互斥标签”；按类别查看时
+保留该类别在各层的完整区域。旧导出没有独立层时沿用历史显示，必须重新推理才能补齐这些证据。
 
 最终类别预测保存在 `mapped_labels.png`，其中已包含通过验证的周期补齐。`label_periodic_valid.png` 单独记录由周期补齐的标签像素；app 可切换“全部预测 / 直接配准 / 周期补全”观察。
 
@@ -375,7 +419,13 @@ mask 和背景有效性；不能沿排列轴周期复制实例，也不能补出
 目标 ROI 仍不能被填充。诊断中的 `evidence_pixels` / `occluded_pixels` 可用于区分验证证据
 与遮挡下的标签迁移；覆盖率表示标签有效范围，不是缺陷检测准确率或分割 GT 准确率。
 
-`ambiguous_identity` 表示候选不足以区分，不输出身份；`partial_reference` 表示使用了不完整源参考，
+`ambiguous_identity` 表示身份顺序仍有歧义。全局配准已接受时，局部周期模式可在各接近候选
+共同确认的前景像素写入语义类别，身份仍为未知，已有的其他前景类别受到保护。
+两项像素数分别记录在 `semantic_consensus_pixels` 和 `semantic_consensus_added_pixels`。
+若矩形裁剪后仍有身份歧义，且已有可用于对象补全的周期几何，Matcher 会在原尺寸画布上
+用同一有效区复核身份。原画布与裁剪结果给出同一顺序且复核通过身份门槛时，才按复核结果
+继续逐区域验证补全。复核状态和两次分差记录在 `identity_retry`。
+`partial_reference` 表示使用了不完整源参考，
 未看到的范围保持未知。`accepted` 仅表示通过当前匹配条件。模板分差不足时，仅当几何匹配已通过且
 物体身份有充分证据，才以 `accepted_ordered_objects` 解决语义模板歧义；不会绕过几何门限。
 
@@ -422,6 +472,27 @@ python -m unittest discover -s tests -t . -p "test_*.py" -v
 每次运行建议使用新的输出目录，便于保存不同参数结果。重用输出目录时，仅清理程序拥有的已知结果文件，避免上次的真实标签被误认成本次结果；其他文件不会删除。禁止输出覆盖配置中的输入文件。
 
 文件流程可通过 `from periodic_template_matcher import run_config` 导入，再调用 `run_config(config_path, output_dir)`，返回与 `result.json` 相同的字典。
+
+重复使用同一套模板时，可以在创建 Matcher 时完成配置读取和预处理。
+
+```python
+from periodic_template_matcher import PeriodicTemplateMatcher
+
+matcher = PeriodicTemplateMatcher(config_path)
+result = matcher.infer()
+images = matcher.save_images(result, output_dir)
+manifest = matcher.save_json(result, output_dir, artifacts=images)
+```
+
+`infer()` 返回内存中的 `MatchResult`。`save_images()` 只写 PNG，`save_json()` 只写
+`result.json`，可单独调用。若在同一个目录使用两者，传入 `artifacts=images` 让 JSON 引用已保存图片。
+`save_result()` 一次性保存查看器所需的完整结果，包括独立的变换矩阵文件。
+`infer_to()` 组合推理与完整保存，返回结果字典。传入 `timings={}` 可收集本次调用的
+`seconds` 和单独的 `image_save_seconds`。`seconds` 保留推理和 JSON 导出耗时，扣除 PNG 编码与写盘。
+
+目标路径省略时使用配置中的
+`target`，显式传入的相对路径以配置文件所在目录为准。配置含有 `target_valid_mask` 时，该掩膜只适用于默认目标。
+模板文件、默认目标及配置以构造时的内容为准，文件变更后请创建新实例。
 
 ## 模块结构与阅读顺序
 
@@ -645,10 +716,10 @@ matcher.save_result(evaluated, "periodic_template_matcher/results/my_evaluation"
 
 | 分组 | 参数与作用 |
 | --- | --- |
-| `step1` | 预处理：`scale`、`max_side`、默认 `valid_height` |
+| `step1` | 预处理：`scale`、`max_side`、`valid_height`、`valid_x_start`、`valid_x_end`、`valid_y_start`、`valid_y_end` |
 | `step2` | 粗匹配：`backend`、`angles`、`scales`、`peaks_per_hypothesis`、`seed` |
 | `step3` | 精配准与判定：`refine_candidates`、`ecc_iterations`、`edge_tolerance_px`、`min_overlap`、`min_score`、`min_template_gap`、`min_candidate_gap` |
-| `periodic` | 周期补全：`periodic_completion`、`period_vectors`、`periodic_anchor_class`、`periodic_max_steps`、`periodic_min_ncc`、`periodic_min_edge` |
+| `periodic` | 周期补全：`periodic_completion`、`shared_periods`、`period_vectors`、`periodic_anchor_class`、`periodic_max_steps`、`periodic_min_ncc`、`periodic_min_edge` |
 | `evaluation` | 标签策略与评估：`label_mode`、`include_background` |
 
 分组用于组织配置；`min_overlap` 等共享阈值也会影响粗匹配筛选。图像路径、每张图像的有效高度和标注仍位于原有位置；顶层 `label_mode` 若存在则优先于 `options.evaluation.label_mode`。

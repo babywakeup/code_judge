@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import json
@@ -10,11 +12,24 @@ import json
 import cv2
 
 from ...config import MatcherConfig
-from ...matcher import PeriodicTemplateMatcher
 from ...utils import read_image
-from ...utils.types import Diagnostics, PathInput, Resolver
+from ...utils.types import Diagnostics, Image, LabelInput, Mask, PathInput, Resolver
+from ..models import MatchResult
 from .annotations import load_labels, load_objects, object_layout, layout_axis
 from .export import ARTIFACTS
+
+
+_TEMPLATE_PATH_FIELDS = ('image', 'labels', 'labelme', 'annotation_valid', 'valid_mask')
+
+
+@dataclass
+class TemplateFiles:
+    images: list[Image]
+    labels: list[LabelInput | None]
+    valids: list[Mask | None]
+    annotations: list[Mask | None]
+    heights: list[int | None]
+    objects: list[list[Diagnostics]] | None
 
 
 def unique_templates(
@@ -43,64 +58,88 @@ def unique_templates(
     return unique, aliases
 
 
+class InferenceFiles:
+    """Read configured assets and attach file provenance to an array result."""
+
+    def __init__(self, config_path: PathInput) -> None:
+        self.path = Path(config_path).resolve()
+        spec = json.loads(self.path.read_text(encoding='utf-8-sig'))
+        self.options = dict(spec.get('options', {}))
+        self.config = MatcherConfig.from_options(self.options, object_order_axis=layout_axis(spec['templates']))
+        self.config.label_mode = spec.get('label_mode', self.config.label_mode)
+        self.config.validate()
+        self.specs, self.aliases = unique_templates(spec['templates'], self.resolve)
+        for template in self.specs:
+            for key in _TEMPLATE_PATH_FIELDS:
+                if template.get(key):
+                    template[key] = str(self.resolve(template[key]))
+        self.input_template_count = len(spec['templates'])
+        self.layouts = [
+            object_layout(s, self.config.ordered_object_class)
+            if self.config.ordered_object_class is not None or 'instance_layouts' in s else None
+            for s in self.specs]
+        self.default_target = self.resolve(spec['target']) if spec.get('target') else None
+        self.target_mask = self.resolve(spec['target_valid_mask']) if spec.get('target_valid_mask') else None
+        self.target_height = spec.get('target_valid_height')
+        self.input_paths = {self.path, self.default_target, self.target_mask}
+        for template in spec['templates']:
+            self.input_paths.update(self.resolve(template[key]) for key in
+                                    _TEMPLATE_PATH_FIELDS
+                                    if template.get(key))
+
+    def resolve(self, value: PathInput) -> Path:
+        return (self.path.parent / value).resolve()
+
+    def read_templates(self) -> TemplateFiles:
+        specs = self.specs
+        images = [read_image(self.resolve(s['image'])) for s in specs]
+        labels = [load_labels(s, self.resolve, im.shape[:2]) for s, im in zip(specs, images)]
+        cfg = self.config
+        objects = ([load_objects(s, self.resolve, im.shape[:2], cfg.ordered_object_class, cfg.object_cycle)
+                    for s, im in zip(specs, images)] if cfg.ordered_object_class is not None else None)
+        valids = [self._mask(s, 'valid_mask') for s in specs]
+        annotations = [self._mask(s, 'annotation_valid') for s in specs]
+        return TemplateFiles(images, labels, valids, annotations,
+                             [s.get('valid_height') for s in specs], objects)
+
+    def _mask(self, spec: Diagnostics, key: str) -> Mask | None:
+        return read_image(self.resolve(spec[key]), cv2.IMREAD_GRAYSCALE) if spec.get(key) else None
+
+    def target_path(self, target: PathInput | None) -> Path:
+        path = self.default_target if target is None else self.resolve(target)
+        if path is None:
+            raise ValueError('Provide a target image or configure a default target')
+        if self.target_mask is not None and path != self.default_target:
+            raise ValueError('The configured target_valid_mask applies only to the default target')
+        return path
+
+    def read_target(self, path: Path) -> tuple[Image, Mask | None]:
+        valid = read_image(self.target_mask, cv2.IMREAD_GRAYSCALE) if self.target_mask is not None else None
+        return read_image(path), valid
+
+    def annotate(self, match: MatchResult, target: Path, labels: Sequence[LabelInput | None]) -> None:
+        result = match.registration
+        result.update(template_names=[s['name'] for s in self.specs], target=str(target),
+                      input_template_count=self.input_template_count, unique_template_count=len(self.specs),
+                      template_aliases=deepcopy(self.aliases), warnings=[])
+        if 'classes' in self.options:
+            result['class_rules'] = deepcopy(self.options['classes'])
+        result['template_instance_layouts'] = [
+            {str(self.config.ordered_object_class): deepcopy(layout)} if layout is not None else {}
+            for layout in self.layouts]
+        for candidate, template in zip(result['matches'], self.specs):
+            candidate.update(template_name=template['name'], template_image=template['image'],
+                             annotation_available=labels[candidate['template_index']] is not None)
+        selected = self.specs[result['ranking'][0]]
+        result['class_names'] = {str(value): name for name, value in selected.get('class_map', {}).items()}
+
+    def validate_output(self, out: Path, target: Path | None, names: Sequence[str] = ARTIFACTS) -> None:
+        inputs = self.input_paths | {target}
+        if any((out / name).resolve() in inputs for name in names):
+            raise ValueError('Output artifacts must not overwrite input files')
+
+
 def run_config(config_path: PathInput, output_dir: PathInput) -> Diagnostics:
-    config_path, out = Path(config_path).resolve(), Path(output_dir).resolve()
-    spec = json.loads(config_path.read_text(encoding='utf-8-sig'))
+    from ...matcher import PeriodicTemplateMatcher
 
-    def resolve(value: str) -> Path:
-        return (config_path.parent / value).resolve()
-
-    options = dict(spec.get('options', {}))
-    cfg = MatcherConfig.from_options(options, object_order_axis=layout_axis(spec['templates']))
-    cfg.label_mode = spec.get('label_mode', cfg.label_mode)
-    cfg.validate()
-    specs, aliases = unique_templates(spec['templates'], resolve)
-    # Validate explicit layouts even if instance matching was accidentally disabled.
-    layouts = [object_layout(s, cfg.ordered_object_class)
-               if cfg.ordered_object_class is not None or 'instance_layouts' in s else None
-               for s in specs]
-    images = [read_image(resolve(s['image'])) for s in specs]
-    target = read_image(resolve(spec['target']))
-    valids = [read_image(resolve(s['valid_mask']), cv2.IMREAD_GRAYSCALE)
-              if s.get('valid_mask') else None for s in specs]
-    tv = read_image(resolve(spec['target_valid_mask']), cv2.IMREAD_GRAYSCALE) if spec.get('target_valid_mask') else None
-    # Validate even non-selected annotations, so a bad template cannot hide silently.
-    labels = [load_labels(s, resolve, im.shape[:2]) for s, im in zip(specs, images)]
-    objects = [load_objects(s, resolve, im.shape[:2], cfg.ordered_object_class, cfg.object_cycle)
-               for s, im in zip(specs, images)] if cfg.ordered_object_class is not None else None
-    # Annotation knowledge and image ROI are intersected once inside match().
-    annotation_valids = [read_image(resolve(s['annotation_valid']), cv2.IMREAD_GRAYSCALE)
-                        if s.get('annotation_valid') else None for s in specs]
-    matcher = PeriodicTemplateMatcher(cfg)
-    matched = matcher.match(images, labels, target,
-                            template_valids=valids,
-                            annotation_valids=annotation_valids,
-                            target_valid=tv,
-                            template_valid_heights=[s.get('valid_height') for s in specs],
-                            target_valid_height=spec.get('target_valid_height'),
-                            template_objects=objects)
-    result = matched.registration
-    result.update(template_names=[s['name'] for s in specs], target=str(resolve(spec['target'])),
-                  input_template_count=len(spec['templates']), unique_template_count=len(specs),
-                  template_aliases=aliases, warnings=[])
-    if 'classes' in options:
-        result['class_rules'] = options['classes']
-    result['template_instance_layouts'] = [
-        {str(cfg.ordered_object_class): layout} if layout is not None else {} for layout in layouts]
-    for match, template in zip(result['matches'], specs):
-        match.update(template_name=template['name'], template_image=str(resolve(template['image'])),
-                     annotation_available=labels[match['template_index']] is not None)
-    selected = specs[result['ranking'][0]]
-    result['class_names'] = {str(value): name for name, value in selected.get('class_map', {}).items()}
-    # The exporter replaces owned artifacts; none may be configured input files.
-    inputs = {config_path, resolve(spec['target'])}
-    if spec.get('target_valid_mask'):
-        inputs.add(resolve(spec['target_valid_mask']))
-    for template in spec['templates']:
-        inputs.update(resolve(template[key]) for key in
-                      ('image', 'labels', 'labelme', 'valid_mask', 'annotation_valid')
-                      if template.get(key))
-    if any((out / name).resolve() in inputs for name in ARTIFACTS):
-        raise ValueError('Output artifacts must not overwrite input files')
-    manifest = matcher.save_result(matched, out)
-    return json.loads(manifest.read_text(encoding='utf-8'))
+    return PeriodicTemplateMatcher(config_path).infer_to(output_dir)

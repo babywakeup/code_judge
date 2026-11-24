@@ -12,8 +12,10 @@ from ...config import MatcherConfig
 from ...utils import ValidRegion, to_gray, warp_labels, warp_valid_mask
 from ...utils.types import Array, BoolMask, LabelMap, Mask
 from ..registration.core import _features
-from ..registration.scoring import _refine, _score
+from ..registration.scoring import ScoreWarp, _refine, _score, prepare_refinement_target
 from ..models import MatchResult
+from .lattice import calibrate_lattice
+from .regions import RegionResize, component_regions
 
 
 def anchor_vectors(labels: LabelMap, valid: Mask, class_id: int) -> list[Array]:
@@ -74,6 +76,7 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
     scale = cfg.matching_scale(source.shape, target.shape)
     ss = (round(source.shape[1]*scale), round(source.shape[0]*scale))
     ts = (round(w*scale), round(h*scale))
+    resize_region = RegionResize((h, w), ts)
     Da = np.diag([ss[0]/source.shape[1], ss[1]/source.shape[0], 1.])
     Db = np.diag([ts[0]/w, ts[1]/h, 1.])
 
@@ -170,40 +173,82 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         if not vectors:
             finish('no_period')
             return
+    lattice = None
+    if cfg.shared_periods:
+        lattice = calibrate_lattice(src, dst, vectors, H, Da, Db, cfg,
+                                    configured=period_source == 'configured',
+                                    objects=result.registration.get('ordered_objects'))
+        vectors = [np.asarray(axis['source_vector']) for axis in lattice]
+        info.update(period_vectors=[v.tolist() for v in vectors], lattice=lattice,
+                    shared_geometry_copies=0, copy_refinement_calls=0)
     offsets = [v for v in product(range(-cfg.periodic_max_steps, cfg.periodic_max_steps+1), repeat=len(vectors))
                if any(v)]
     offsets.sort(key=lambda v: (sum(abs(x) for x in v), v))
+    refinement = None
     for offset in offsets:
+        active_vectors = [v for n, v in zip(offset, vectors) if n]
         shift = sum((n*v for n, v in zip(offset, vectors)), np.zeros(2))
         P = np.eye(3)
         P[:2, 2] = shift
         candidate = H @ P
+        shared = lattice is not None and all(axis['verified'] for n, axis in zip(offset, lattice) if n)
+        if shared:
+            target_shift = sum((n*np.asarray(axis['target_vector']) for n, axis in zip(offset, lattice)), np.zeros(2))
+            candidate = H.copy()
+            candidate[:2, 2] += target_shift
         # Skip candidates unable to supply any currently unknown annotation.
-        ann = warp_valid_mask(annotation_valid, candidate, target.shape)
-        if not (ann & target_valid & ~result.label_valid).any() and not needs_object_geometry:
+        has_unknown = not result.label_valid[target_valid].all()
+        needs_geometry = needs_object_geometry
+        if cfg.shared_periods:
+            needs_geometry = (needs_object_geometry
+                              and cfg.allows_periodic_shift(cfg.ordered_object_class, active_vectors))
+        ann = (warp_valid_mask(annotation_valid, candidate, target.shape)
+               if has_unknown or not cfg.shared_periods else None)
+        supplies_labels = bool(ann is not None and (ann & target_valid & ~result.label_valid).any())
+        if not supplies_labels and not needs_geometry:
             continue
         work = Db @ candidate @ np.linalg.inv(Da)
-        initial_metrics = _score(src, dst, work, local_cfg)
-        refined, ecc_ok = _refine(src, dst, work, local_cfg)
-        refined_metrics = _score(src, dst, refined, local_cfg)
+        initial_warp = ScoreWarp(src, work, ts)
+        initial_metrics = _score(src, dst, work, local_cfg, warped=initial_warp)
+        if shared:
+            # Geometry is H plus a verified integer lattice displacement. Do
+            # not independently bend every x/y/diagonal copy with affine ECC.
+            refined, ecc_ok = work, False
+            info['shared_geometry_copies'] += 1
+        else:
+            if refinement is None:
+                refinement = prepare_refinement_target(dst)
+            refined, ecc_ok = _refine(src, dst, work, local_cfg, prepared=refinement, initial_warp=initial_warp)
+            if lattice is not None:
+                info['copy_refinement_calls'] += 1
+        refined_warp = initial_warp if np.array_equal(refined, work) else ScoreWarp(src, refined, ts)
         # Prevent ECC from jumping to another cell or destroying the lattice.
         points = np.array([[[ss[0]*.2, ss[1]*.2], [ss[0]*.8, ss[1]*.8], [ss[0]*.5, ss[1]*.5]]], np.float32)
         displacement = np.linalg.norm(cv2.perspectiveTransform(points, work)-cv2.perspectiveTransform(points, refined), axis=2)
         limit = min(16., min(np.linalg.norm(Db[:2, :2] @ H[:2, :2] @ v) for v in vectors)*.1)
-        if refined_metrics['match_score'] >= initial_metrics['match_score'] and displacement.max() <= limit:
+        within_limit = bool(displacement.max() <= limit)
+        refined_metrics = (initial_metrics if refined_warp is initial_warp or not within_limit else
+                   _score(src, dst, refined, local_cfg, warped=refined_warp))
+        if within_limit and refined_metrics['match_score'] >= initial_metrics['match_score']:
             candidate = np.linalg.inv(Db) @ refined @ Da
             metrics = refined_metrics
+            selected_warp = refined_warp
         else:
             metrics, ecc_ok = initial_metrics, False
+            selected_warp = initial_warp
         accepted = metrics['structure_ncc'] >= cfg.periodic_min_ncc and metrics['edge_alignment'] >= cfg.periodic_min_edge
         record = dict(offset=list(offset), accepted=bool(accepted), metrics=metrics,
                       geometry_accepted=bool(accepted), ecc_converged=bool(ecc_ok),
                       matrix_template_to_target=candidate.tolist(), added_label_pixels=0)
+        if lattice is not None:
+            record['refinement_mode'] = 'shared_lattice' if shared else 'independent_fallback'
         info['copies'].append(record)
         if not accepted:
             continue
+        if cfg.shared_periods and not supplies_labels:
+            record['accepted'] = False
+            continue
         mapped, ann = warp_labels(labels, candidate, target.shape, annotation_valid)
-        active_vectors = [v for n, v in zip(offset, vectors) if n]
         allowed = {c for c in policy_classes if cfg.allows_periodic_shift(c, active_vectors)}
         blocked = policy_classes - allowed
         record['blocked_class_ids'] = sorted(blocked)
@@ -218,21 +263,21 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         fill_labels = _candidate_fill(mapped, ann, target_valid, result.mapped_labels, result.label_valid)
         # Validate each new connected region, not only the large aligned interior.
         # A bounded context supplies edges for thin strips and corner fragments.
-        count, components = cv2.connectedComponents(fill_labels.astype(np.uint8))
         approved = np.zeros((h, w), bool)
         record['local_regions'] = []
         candidate_work = Db @ candidate @ np.linalg.inv(Da)
-        for component in range(1, count):
-            region = components == component
-            local = cv2.resize(region.astype(np.uint8), ts, interpolation=cv2.INTER_NEAREST)
+        score_warp = (selected_warp if np.array_equal(candidate_work, selected_warp.H)
+                      else ScoreWarp(src, candidate_work, ts))
+        for region in component_regions(fill_labels):
+            local = resize_region(region)
             local = cv2.dilate(local, np.ones((25, 25), np.uint8)) & dst[3]
             local_dst = (dst[0], dst[1], dst[2], local)
-            local_metrics = _score(src, local_dst, candidate_work, local_cfg)
+            local_metrics = _score(src, local_dst, candidate_work, local_cfg, warped=score_warp)
             local_ok = (local_metrics['structure_ncc'] >= cfg.periodic_min_ncc
                         and local_metrics['edge_alignment'] >= cfg.periodic_min_edge)
-            record['local_regions'].append(dict(accepted=bool(local_ok), pixels=int(region.sum()), metrics=local_metrics))
+            record['local_regions'].append(dict(accepted=bool(local_ok), pixels=region.pixels, metrics=local_metrics))
             if local_ok:
-                approved |= region
+                approved[region.slices] |= region.mask
         fill_labels = approved
         record['accepted'] = bool(fill_labels.any())
         if not fill_labels.any():
@@ -249,6 +294,6 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         result.completed_valid |= fill_image
         result.periodic_valid |= fill_image
         record['added_label_pixels'] = int(fill_labels.sum())
-        if result.label_valid[target_valid].all():
+        if result.label_valid[target_valid].all() and not (cfg.shared_periods and needs_object_geometry):
             break
     finish()

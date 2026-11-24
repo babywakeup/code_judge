@@ -11,7 +11,7 @@
 指定其他数据集或端口：
 
 ```powershell
-python -m apps.sd1_viewer --dataset D:\datasets\SD-1 --port 7876 --no-browser
+python -m apps.sd1_viewer --dataset D:\\datasets\\SD-1 --port 7876 --no-browser
 ```
 
 数据目录必须包含 `imgs/` 和 `Annotations/`。按相对目录与同名文件配对，如 `imgs/TN4FL0/a.jpg` 对应 `Annotations/TN4FL0/a.xml`，不会混用其他目录下的同名文件。支持 JPG、JPEG、PNG、BMP、WebP（解码取决于浏览器）及 Pascal VOC XML。

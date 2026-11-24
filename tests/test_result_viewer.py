@@ -1,4 +1,6 @@
 """Saved prediction contracts and independent viewer rendering."""
+import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -38,6 +40,41 @@ class SavedResultTests(unittest.TestCase):
             self.assertTrue(saved.valid[6, 6])
             self.assertFalse(saved.valid[0, 0])
             self.assertFalse((Path(tmp) / 'report.html').exists())
+
+    def test_images_and_json_can_be_saved_independently(self):
+        from periodic_template_matcher.app.data import load_result
+        matcher = PeriodicTemplateMatcher()
+        result = self.make_result()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = matcher.save_json(result, root/'json_only')
+            self.assertEqual(list(manifest.parent.iterdir()), [manifest])
+            metadata = json.loads(manifest.read_text(encoding='utf-8'))
+            self.assertEqual(metadata['artifacts'], {})
+            self.assertEqual(metadata['prediction_status'], 'available')
+            self.assertFalse(metadata['labels_exported'])
+            self.assertEqual(metadata['class_pixels']['1001'], 100)
+
+            out = root/'images_then_json'
+            artifacts = matcher.save_images(result, out)
+            self.assertEqual({p.name for p in out.iterdir()}, set(artifacts.values()))
+            manifest = matcher.save_json(result, out, artifacts=artifacts)
+            saved = load_result(manifest)
+            np.testing.assert_array_equal(saved.labels, result.mapped_labels)
+            np.testing.assert_array_equal(saved.valid, result.label_valid)
+            self.assertTrue(saved.metadata['labels_exported'])
+
+    def test_json_only_replaces_existing_manifest_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            original = out/'notes.txt'
+            original.write_text('keep', encoding='utf-8')
+            os.link(original, out/'result.json')
+
+            manifest = PeriodicTemplateMatcher().save_json(self.make_result(), out)
+
+            self.assertEqual(original.read_text(encoding='utf-8'), 'keep')
+            self.assertEqual(json.loads(manifest.read_text(encoding='utf-8'))['artifacts'], {})
 
     def test_rejected_rerun_removes_old_prediction_but_preserves_other_files(self):
         from periodic_template_matcher.app.data import load_result

@@ -26,6 +26,11 @@ class LabelTransferStep:
         mapped, valid = warp_labels(labels, match.matrix, inputs.target.shape, source_roi)
         valid &= inputs.target_roi
         mapped[~valid] = 0
+        # Snapshot the semantic branch, not the full template annotations:
+        # the ordered class requires independent object localization and must
+        # not reappear through the direct layer in all-source rendering.
+        match.result.direct_labels = mapped.copy()
+        match.result.direct_valid = valid.copy()
         match.result.mapped_labels, match.result.label_valid = mapped, valid
         return TransferredLabels(labels, source_roi)
 

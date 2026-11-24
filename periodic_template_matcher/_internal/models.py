@@ -33,6 +33,14 @@ class MatchResult:
     object_valid: BoolMask | None = None
     base_labels: LabelMap | None = None
     base_valid: BoolMask | None = None
+    # Independent hypotheses, not a partition of the final exclusive label map.
+    direct_labels: LabelMap | None = None
+    direct_valid: BoolMask | None = None
+    completion_labels: LabelMap | None = None
+    completion_valid: BoolMask | None = None
+    object_labels: LabelMap | None = None
+    object_layer_valid: BoolMask | None = None
+    object_layer_identities: LabelMap | None = None
 
     @property
     def accepted(self) -> bool:
@@ -66,6 +74,27 @@ class EvaluationResult:
 
 
 @dataclass
+class PreparedTemplates:
+    """Validated template data that can be shared by independent inferences."""
+
+    images: Sequence[Image]
+    labels: list[LabelMap | None]
+    valids: list[Mask]
+    annotation_valids: Sequence[Mask | None]
+    regions: list[Diagnostics]
+    objects: list[list[Diagnostics]] | None
+    original_images: Sequence[Image] | None = None
+
+
+@dataclass
+class PreparedTarget:
+    image: Image
+    valid: Mask
+    region: Diagnostics
+    original_image: Image | None = None
+
+
+@dataclass
 class PreparedInputs:
     """Validated arrays; image ROI and annotation knowledge remain independent."""
 
@@ -77,6 +106,8 @@ class PreparedInputs:
     target_valid: Mask
     regions: Diagnostics
     objects: list[list[Diagnostics]] | None
+    original_templates: Sequence[Image] | None = None
+    original_target: Image | None = None
 
     @property
     def target_roi(self) -> BoolMask:

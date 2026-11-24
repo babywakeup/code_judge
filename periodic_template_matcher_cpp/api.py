@@ -1,10 +1,14 @@
 """Python IO/API adapter. All matching, completion and metric computation is native."""
 from copy import deepcopy
 from dataclasses import asdict
+import json
+from pathlib import Path
+
 import numpy as np
 from periodic_template_matcher.config import MatcherConfig
 from periodic_template_matcher._internal.models import MatchResult, EvaluationResult
 from periodic_template_matcher._internal.io.export import save_result
+from periodic_template_matcher._internal.io.workflow import InferenceFiles
 from . import _native
 
 
@@ -54,9 +58,17 @@ class PeriodicTemplateMatcher:
 
 
 def run_config(config_path,output_dir):
-    # The original workflow is IO-only, but its global matcher is Python's class.
-    # Clone the function's globals per call; never patch shared module state.
-    import types
-    from periodic_template_matcher._internal.io.workflow import run_config as workflow
-    namespace=dict(workflow.__globals__,PeriodicTemplateMatcher=PeriodicTemplateMatcher)
-    return types.FunctionType(workflow.__code__,namespace,workflow.__name__)(config_path,output_dir)
+    files = InferenceFiles(config_path)
+    target_path = files.target_path(None)
+    templates = files.read_templates()
+    target, valid = files.read_target(target_path)
+    matcher = PeriodicTemplateMatcher(files.config)
+    result = matcher.match(templates.images, templates.labels, target,
+                           template_valids=templates.valids, annotation_valids=templates.annotations,
+                           target_valid=valid, template_valid_heights=templates.heights,
+                           target_valid_height=files.target_height, template_objects=templates.objects)
+    files.annotate(result, target_path, templates.labels)
+    out = Path(output_dir).resolve()
+    files.validate_output(out, target_path)
+    manifest = matcher.save_result(result, out)
+    return json.loads(manifest.read_text(encoding='utf-8'))

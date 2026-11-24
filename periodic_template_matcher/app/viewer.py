@@ -12,7 +12,8 @@ from .data import SavedPrediction, class_color, load_result, render_view, source
 
 
 MODES = {'叠加': 'overlay', '左右对照': 'split', '原图': 'input', '类别 Mask': 'mask'}
-SOURCES = {'全部预测': 'all', '直接配准': 'direct', '周期补全': 'periodic', '独立物体': 'objects'}
+SOURCES = {'全部来源（重叠混色）': 'all', '最终互斥标签': 'fused',
+           '直接配准': 'direct', '周期补全': 'periodic', '独立物体': 'objects'}
 
 
 class PredictionViewer(tk.Tk):
@@ -32,7 +33,7 @@ class PredictionViewer(tk.Tk):
         self._drag = (0, 0)
         self._class_ids: list[int | None] = [None]
         self.mode = tk.StringVar(value='左右对照')
-        self.source = tk.StringVar(value='全部预测')
+        self.source = tk.StringVar(value='全部来源（重叠混色）')
         self.opacity = tk.DoubleVar(value=.5)
         self.class_name = tk.StringVar(value='全部前景')
         self.identity_name = tk.StringVar(value='全部身份')
@@ -226,6 +227,14 @@ class PredictionViewer(tk.Tk):
                     object_id = str(int(self.data.object_identities[y, x]))
                     identity = self.data.metadata.get('ordered_objects', {}).get('identity_names', {}).get(object_id, object_id)
                     state = f'类别 ID {self.data.labels[y, x]} · 独立物体 {identity}'
+        evidence = []
+        for name, labels, valid in (('直接', self.data.direct_labels, self.data.direct_valid),
+                                    ('补全', self.data.completion_labels, self.data.completion_valid),
+                                    ('对象', self.data.object_labels, self.data.object_layer_valid)):
+            if labels is not None and valid is not None and valid[y, x] and labels[y, x] > 0:
+                evidence.append(f'{name}={labels[y, x]}')
+        if evidence:
+            state = '最终：'+state+' | 独立层：'+' / '.join(evidence)
         self.pixel.set(f'原图 x={x}, y={y}  |  {state}  |  缩放 {self.scale:.0%}  |  滚轮缩放 / 拖动平移')
 
     def request_render(self) -> None:

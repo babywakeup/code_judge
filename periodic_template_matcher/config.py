@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from math import isfinite
 from typing import Any
 
@@ -12,12 +12,14 @@ OPTION_GROUPS = {
     'objects': {'ordered_object_class', 'object_cycle', 'object_min_score', 'object_min_gap',
                 'object_min_visible', 'object_candidates', 'object_spacing_weight', 'object_order_axis',
                 'object_visible_count'},
-    'step1': {'scale', 'max_side', 'valid_height'},
+    'step1': {'scale', 'max_side', 'valid_height',
+              'valid_x_start', 'valid_x_end', 'valid_y_start', 'valid_y_end'},
     'step2': {'backend', 'angles', 'scales', 'peaks_per_hypothesis', 'seed', 'template_workers'},
-    'step3': {'refine_candidates', 'ecc_iterations', 'edge_tolerance_px',
+    'step3': {'refine_candidates', 'ecc_iterations', 'ecc_roi', 'edge_tolerance_px',
               'min_overlap', 'min_score', 'min_template_gap', 'min_candidate_gap'},
     'periodic': {'periodic_completion', 'period_vectors', 'periodic_anchor_class',
-                 'periodic_max_steps', 'periodic_min_ncc', 'periodic_min_edge', 'class_periodicity'},
+                 'periodic_max_steps', 'periodic_min_ncc', 'periodic_min_edge', 'class_periodicity',
+                 'shared_periods'},
     'evaluation': {'label_mode', 'include_background'},
 }
 
@@ -70,12 +72,14 @@ class MatcherConfig:
     valid_height: int | None = None  # Default original-pixel height for all images.
     edge_tolerance_px: float = 2.0  # Working-resolution pixels, not native pixels.
     ecc_iterations: int = 70
+    ecc_roi: bool = False  # Opt-in padded local ECC; floating-point results may differ.
     seed: int = 7
     label_mode: str = 'semantic'
     include_background: bool = False
     backend: str = 'fft'
     template_workers: int = 0  # 0: auto, up to four templates; 1: serial registration.
     periodic_completion: bool = False
+    shared_periods: bool = False  # Jointly verified translation lattice; no per-copy affine drift.
     period_vectors: Sequence[Sequence[float]] = ()  # Optional source-original pixel lattice vectors.
     periodic_anchor_class: int = 1
     periodic_max_steps: int = 2
@@ -94,6 +98,10 @@ class MatcherConfig:
     object_min_visible: float = .15
     object_candidates: int = 8
     object_spacing_weight: float = .3
+    valid_x_start: int = 0
+    valid_x_end: int | None = None
+    valid_y_start: int = 0
+    valid_y_end: int | None = None
 
     @classmethod
     def from_options(cls, options: dict[str, Any], *, object_order_axis: str | None = None) -> MatcherConfig:
@@ -138,6 +146,11 @@ class MatcherConfig:
         return self.scale if self.scale is not None else min(
             1.0, self.max_side / max(max(shape[:2]) for shape in shapes))
 
+    def without_valid_region(self) -> MatcherConfig:
+        """The registration stage receives inputs whose ROI has already been resolved."""
+        return replace(self, valid_height=None, valid_x_start=0, valid_x_end=None,
+                       valid_y_start=0, valid_y_end=None)
+
     def periodic_axes(self, class_id: int) -> tuple[str, ...]:
         """Allowed source axes; an explicit empty list means no periodic copies."""
         if not self.class_periodicity:
@@ -165,6 +178,16 @@ class MatcherConfig:
         return all(abs(v[axis]) > 0 and abs(v[1-axis]) <= .15*abs(v[axis]) for v in vectors)
 
     def validate(self) -> None:
+        if type(self.ecc_roi) is not bool:
+            raise ValueError('ecc_roi must be bool')
+        if type(self.shared_periods) is not bool:
+            raise ValueError('shared_periods must be bool')
+        for axis, start, end in (('x', self.valid_x_start, self.valid_x_end),
+                                 ('y', self.valid_y_start, self.valid_y_end)):
+            if type(start) is not int or start < 0:
+                raise ValueError(f'valid_{axis}_start must be a nonnegative integer')
+            if end is not None and (type(end) is not int or end <= start):
+                raise ValueError(f'valid_{axis}_end must be an integer greater than valid_{axis}_start')
         if type(self.template_workers) is not int or self.template_workers < 0:
             raise ValueError('template_workers must be a nonnegative integer (0=auto, 1=serial)')
         if self.object_order_axis not in ('x', 'y'):

@@ -35,12 +35,25 @@ class SavedPrediction:
     valid: BoolMask | None
     periodic: BoolMask | None
     object_identities: LabelMap | None = None
+    direct_labels: LabelMap | None = None
+    direct_valid: BoolMask | None = None
+    completion_labels: LabelMap | None = None
+    completion_valid: BoolMask | None = None
+    object_labels: LabelMap | None = None
+    object_layer_valid: BoolMask | None = None
+    object_layer_identities: LabelMap | None = None
 
     @property
     def class_ids(self) -> list[int]:
         if self.labels is None or self.valid is None:
             return []
-        return [int(value) for value in np.unique(self.labels[self.valid])]
+        values = set(int(value) for value in np.unique(self.labels[self.valid]))
+        for labels, valid in ((self.direct_labels, self.direct_valid),
+                              (self.completion_labels, self.completion_valid),
+                              (self.object_labels, self.object_layer_valid)):
+            if labels is not None and valid is not None:
+                values.update(int(value) for value in np.unique(labels[valid]))
+        return sorted(values)
 
 
 def load_result(path: PathInput) -> SavedPrediction:
@@ -100,7 +113,63 @@ def load_result(path: PathInput) -> SavedPrediction:
         object_identities = read_image(artifact('object_identities'), cv2.IMREAD_UNCHANGED)
         if object_identities.shape != shape or object_identities.dtype != np.uint16:
             raise ValueError('Object identity dimensions/type must match input')
-    return SavedPrediction(manifest, metadata, image, labels, valid, periodic, object_identities)
+    layers = {}
+    for layer in ('direct', 'completion', 'object'):
+        label_key = layer+'_labels'
+        valid_key = 'object_layer_valid' if layer == 'object' else layer+'_valid'
+        if label_key not in artifacts and valid_key not in artifacts:
+            continue
+        if labels is None:
+            raise ValueError('Independent layers require an accepted prediction')
+        layer_labels = read_image(artifact(label_key), cv2.IMREAD_UNCHANGED)
+        layer_valid = read_image(artifact(valid_key), cv2.IMREAD_UNCHANGED)
+        if (layer_labels.shape != shape or layer_valid.shape != shape
+                or layer_labels.dtype != np.uint16 or layer_valid.dtype != np.uint8):
+            raise ValueError(f'{layer} layer dimensions/type must match input')
+        layers[label_key] = layer_labels
+        layers[valid_key] = layer_valid > 0
+    if 'object_layer_identities' in artifacts:
+        identities = read_image(artifact('object_layer_identities'), cv2.IMREAD_UNCHANGED)
+        if 'object_labels' not in layers or identities.shape != shape or identities.dtype != np.uint16:
+            raise ValueError('Independent object identities require matching uint16 object labels')
+        layers['object_layer_identities'] = identities
+    return SavedPrediction(manifest, metadata, image, labels, valid, periodic, object_identities, **layers)
+
+
+def _render_layers(data, index, inside, source, class_id, object_identity):
+    """Return independent evidence without forcing overlaps into one class ID."""
+    if source == 'fused':
+        return None
+    layers = (('direct', data.direct_labels, data.direct_valid),
+              ('periodic', data.completion_labels, data.completion_valid),
+              ('objects', data.object_labels, data.object_layer_valid))
+    if not any(labels is not None for _, labels, _ in layers):
+        return None  # Older exports retain their exact historical display.
+    selected = np.zeros(inside.shape, bool)
+    valid = np.zeros(inside.shape, bool)
+    color_sum = np.zeros((*inside.shape, 3), np.uint16)
+    counts = np.zeros(inside.shape, np.uint8)
+    seen = []
+    for name, layer_labels, layer_valid in layers:
+        if source not in ('all', name) or layer_labels is None or layer_valid is None:
+            continue
+        labels = layer_labels[index]
+        known = layer_valid[index] & inside
+        valid |= known
+        pick = known & ((labels > 0) if class_id is None else labels == class_id)
+        if object_identity is not None:
+            if name != 'objects' or data.object_layer_identities is None:
+                continue
+            pick &= data.object_layer_identities[index] == object_identity
+        # Repeated evidence for one class must not bias the overlap color.
+        for earlier_labels, earlier_pick in seen:
+            pick &= ~(earlier_pick & (earlier_labels == labels))
+        color_sum[pick] += CLASS_COLORS[labels[pick]]
+        counts[pick] += 1
+        selected |= pick
+        seen.append((labels, pick.copy()))
+    colors = (color_sum / np.maximum(counts[..., None], 1)).astype(np.uint8)
+    return colors, selected, valid
 
 
 def class_color(class_id: int) -> tuple[int, int, int]:
@@ -125,7 +194,7 @@ def render_view(data: SavedPrediction, size: Size, scale: float,
     panels use the same transform. Rendering cost follows viewport size, so zoom
     never allocates a full enlarged image.
     """
-    if mode not in ('input', 'mask', 'overlay', 'split') or source not in ('all', 'direct', 'periodic', 'objects'):
+    if mode not in ('input', 'mask', 'overlay', 'split') or source not in ('all', 'fused', 'direct', 'periodic', 'objects'):
         raise ValueError('Invalid display mode or prediction source')
     if not np.isfinite(scale) or scale <= 0 or min(size) < 1 or not 0 <= alpha <= 1:
         raise ValueError('Invalid viewport scale, size or opacity')
@@ -148,13 +217,16 @@ def render_view(data: SavedPrediction, size: Size, scale: float,
         object_ids = np.zeros_like(labels) if data.object_identities is None else data.object_identities[index]
         if object_identity is not None:
             selected &= object_ids == object_identity
-        if source != 'all':
+        if source not in ('all', 'fused'):
             periodic = np.zeros_like(valid)
             if data.periodic is not None:
                 periodic = data.periodic[index] & inside
             selected &= (periodic if source == 'periodic' else (object_ids > 0) if source == 'objects'
                          else (~periodic & (object_ids == 0)))
         colors = CLASS_COLORS[labels]
+        independent = _render_layers(data, index, inside, source, class_id, object_identity)
+        if independent is not None:
+            colors, selected, valid = independent
         if mode == 'mask':
             output[:] = (35, 40, 48)
             output[selected] = colors[selected]

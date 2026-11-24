@@ -59,7 +59,10 @@ def warp_valid_mask(mask: Mask, H: Matrix, target_shape: Sequence[int]) -> BoolM
     if H.shape != (3, 3) or not np.isfinite(H).all() or abs(np.linalg.det(H)) < 1e-10:
         raise ValueError('H must be an invertible 3x3 TEMPLATE-to-TARGET matrix')
     h, w = target_shape[:2]
-    return cv2.warpPerspective((mask > 0).astype(np.uint8), H, (w, h),
+    # Nearest-neighbor copies a single pixel, so uint8 keeps the same positivity
+    # after projection without first copying the full source into a binary mask.
+    source = mask if mask.dtype == np.uint8 else (mask > 0).astype(np.uint8)
+    return cv2.warpPerspective(source, H, (w, h),
                                flags=cv2.INTER_NEAREST) > 0
 
 
@@ -80,7 +83,7 @@ def warp_labels(labels: ClassIds, H: Matrix, target_shape: Sequence[int],
     source_mask = np.ones(labels.shape, np.uint8) if source_valid is None else source_valid
     valid = warp_valid_mask(source_mask, H, target_shape)
     h, w = target_shape[:2]
-    warped = cv2.warpPerspective(labels.astype(np.uint16), H, (w, h), flags=cv2.INTER_NEAREST,
+    warped = cv2.warpPerspective(labels.astype(np.uint16, copy=False), H, (w, h), flags=cv2.INTER_NEAREST,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     return warped, valid
 

@@ -8,7 +8,7 @@ import numpy as np
 from periodic_template_matcher import MatcherConfig
 from periodic_template_matcher._internal.pipeline import MatchPipeline
 from periodic_template_matcher._internal.objects.matching import ObjectPrediction
-from periodic_template_matcher._internal.models import RegisteredMatch
+from periodic_template_matcher._internal.models import RegisteredMatch, TransferredLabels
 from periodic_template_matcher._internal.segmentation.evaluation import SegmentationEvaluationStep
 from periodic_template_matcher._internal.objects.fusion import PredictionFusionStep
 from periodic_template_matcher._internal.objects.steps import (
@@ -106,6 +106,73 @@ class MatchStepTests(unittest.TestCase):
         step.run(self.inputs, match, located, self.config)
         self.assertEqual(complete.call_count, 1)
 
+    def test_ambiguous_crop_retries_identity_with_the_same_valid_pixels(self):
+        self.config.ordered_object_class = 2
+        self.config.object_visible_count = 3
+        self.config.valid_x_start = 4
+        self.config.valid_y_start = 5
+        self.config.valid_y_end = 57
+        refs = [[dict(identity='A', mask=(self.labels == 2).astype(np.uint8))]]
+        inputs = self.preparation.run([self.image], [self.labels], self.image,
+                                      template_objects=refs)
+        match = RegistrationStep(Mock(return_value=selection())).run(inputs, self.config)
+        match.result.registration['periodic_completion'] = dict(
+            copies=[dict(geometry_accepted=True, offset=[1])], period_vectors=[[0., 16.]])
+        crop_prediction = self.prediction(status='ambiguous_identity')
+        crop_prediction.diagnostics.update(visible_order='ABC', visible_identities=list('ABC'), order_margin=.005)
+        located = LocatedObjects(crop_prediction, inputs.template_valids)
+        full = self.prediction()
+        full.diagnostics.update(visible_order='ABC', visible_identities=list('ABC'), order_margin=.03)
+        full.labels[20:25, 20:25] = 2
+        locator = Mock(return_value=full)
+        complete = Mock()
+
+        ObjectSupportCompletionStep(complete, locator=locator).run(inputs, match, located, self.config)
+
+        self.assertTrue(located.prediction.diagnostics['identity_retry']['used'])
+        self.assertEqual(located.prediction.labels.shape, inputs.target.shape[:2])
+        np.testing.assert_array_equal(located.prediction.labels, full.labels[5:57, 4:])
+        full_mask = locator.call_args.args[4]
+        self.assertEqual(locator.call_args.args[1][0][0]['_order_axis_bounds'], (4, 64))
+        np.testing.assert_array_equal(full_mask[5:57, 4:], inputs.target_valid)
+        self.assertFalse(full_mask[:5].any())
+        self.assertFalse(full_mask[:, :4].any())
+        self.assertFalse(full_mask[57:].any())
+        self.assertIs(complete.call_args.args[0], located.prediction)
+
+        full.diagnostics.update(visible_order='BCD', visible_identities=list('BCD'))
+        located.prediction = crop_prediction
+        ObjectSupportCompletionStep(complete, locator=locator).run(inputs, match, located, self.config)
+        self.assertIs(located.prediction, crop_prediction)
+        self.assertEqual(located.prediction.diagnostics['status'], 'ambiguous_identity')
+        self.assertFalse(located.prediction.diagnostics['identity_retry']['used'])
+
+        locator.reset_mock()
+        match.result.registration['periodic_completion'].update(
+            copies=[dict(geometry_accepted=True, offset=[1, 0]),
+                    dict(geometry_accepted=False, offset=[0, 1])],
+            period_vectors=[[16., 0.], [0., 16.]])
+        ObjectSupportCompletionStep(complete, locator=locator).run(inputs, match, located, self.config)
+        locator.assert_not_called()
+
+    def test_identity_retry_skips_when_full_canvas_resize_loses_valid_pixels(self):
+        from periodic_template_matcher._internal.objects.retry import retry_cropped_identity
+        self.config.scale = .5
+        self.config.valid_x_start = 1
+        self.config.ordered_object_class = 2
+        self.config.object_visible_count = 3
+        refs = [[dict(identity='A', mask=(self.labels == 2).astype(np.uint8))]]
+        odd_columns = np.zeros(self.image.shape[:2], np.uint8)
+        odd_columns[:, 1::2] = 1
+        inputs = self.preparation.run([self.image], [self.labels], self.image,
+            target_valid=odd_columns, template_objects=refs)
+        match = RegistrationStep(Mock(return_value=selection())).run(inputs, self.config)
+        located = LocatedObjects(self.prediction(status='ambiguous_identity'), inputs.template_valids)
+        locator = Mock()
+        self.assertIs(retry_cropped_identity(inputs, match, located, self.config, locator),
+                      located.prediction)
+        locator.assert_not_called()
+
     def test_support_accepts_legacy_copy_diagnostics(self):
         self.match.result.registration['periodic_completion'] = dict(
             copies=[dict(accepted=True)], period_vectors=[[0., 4.]])
@@ -138,6 +205,27 @@ class MatchStepTests(unittest.TestCase):
         self.assertEqual(prediction.diagnostics['foreground_conflict_pixels'], 16)
         self.assertEqual(result.registration['periodic_completion']['remaining_unknown_pixels'], 128)
 
+    def test_fusion_keeps_consensus_class_without_asserting_identity(self):
+        self.config.ordered_object_class = 2
+        self.inputs.objects = [[]]
+        LabelTransferStep().run(self.inputs, self.match, self.config)
+        result = self.match.result
+        prediction = self.prediction(status='ambiguous_identity')
+        prediction.valid[:] = False
+        consensus = np.zeros_like(prediction.valid)
+        consensus[4:8, 4:8] = True
+        consensus[16:18, 16:18] = True
+        prediction.semantic_foreground = consensus
+        PredictionFusionStep().run(self.inputs, self.match,
+                                   LocatedObjects(prediction, self.inputs.template_valids), self.config)
+
+        self.assertTrue((result.mapped_labels[4:8, 4:8] == 1).all())
+        self.assertTrue((result.mapped_labels[16:18, 16:18] == 2).all())
+        self.assertTrue(result.label_valid[16:18, 16:18].all())
+        self.assertFalse(result.object_identities.any())
+        self.assertFalse(result.object_valid.any())
+        self.assertFalse(result.label_valid[20, 20])
+
     def test_evaluation_keeps_ground_truth_roi_out_of_prepared_inference(self):
         evaluator = SegmentationEvaluationStep(self.config)
         gt_valid = np.zeros_like(self.labels)
@@ -165,6 +253,8 @@ class PipelineOrderTests(unittest.TestCase):
             step.run.side_effect = lambda *args, name=name: self.calls.append(name)
             setattr(self.pipeline, name, step)
         self.pipeline.registration.run.side_effect = lambda *args: self.record('registration', self.match)
+        self.pipeline.label_transfer.run.side_effect = lambda *args: self.record(
+            'label_transfer', TransferredLabels(self.inputs.labels[0], self.inputs.template_valids[0]))
 
     def record(self, name, value):
         self.calls.append(name)
@@ -176,6 +266,8 @@ class PipelineOrderTests(unittest.TestCase):
         self.assertIs(self.pipeline.run(self.inputs), self.match.result)
         self.assertEqual(self.calls, ['registration', 'ordered_objects', 'label_transfer',
                                       'periodic_completion', 'object_support', 'fusion'])
+        self.assertIs(self.pipeline.periodic_completion.run.call_args.args[2].labels,
+                  self.inputs.labels[0])
 
     def test_missing_geometry_stops_before_object_matching(self):
         self.match.matrix = None

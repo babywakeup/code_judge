@@ -41,8 +41,12 @@ def transpose_diagnostics(value):
             item = transpose_matrix(item)
         elif key == 'supporting_transforms':
             item = [transpose_matrix(m) for m in item]
-        elif key == 'target_vector':
+        elif key in ('target_vector', 'source_vector', 'initial_source_vector'):
             item = [item[1], item[0]]
+        elif key == 'source_period_vectors' and item is not None:
+            item = [[v[1], v[0]] for v in item]
+        elif key in ('target_bbox', 'source_target_bbox', 'source_bbox'):
+            item = [item[1], item[0], item[3], item[2]]
         elif key == 'repeat_axes':
             item = ['y' if a == 'x' else 'x' for a in item]
         elif key == 'order_axis':
@@ -54,5 +58,7 @@ def transpose_diagnostics(value):
 
 
 def transpose_prediction(prediction):
+    semantic = prediction.semantic_foreground
     return type(prediction)(transpose_image(prediction.labels), transpose_image(prediction.identities),
-                            transpose_image(prediction.valid), transpose_diagnostics(prediction.diagnostics))
+                            transpose_image(prediction.valid), transpose_diagnostics(prediction.diagnostics),
+                            None if semantic is None else transpose_image(semantic))

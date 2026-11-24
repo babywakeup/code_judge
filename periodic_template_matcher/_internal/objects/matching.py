@@ -13,10 +13,11 @@ from ...config import MatcherConfig
 from ...utils import ValidRegion, to_gray, warp_valid_mask
 from ...utils.types import BoolMask, Diagnostics, Image, LabelMap, Mask, Matrix
 from ..registration.core import _features
-from ..registration.scoring import _refine, _score
+from ..registration.scoring import (ScoreWarp, _refine, _score, prepare_refinement_target,
+                                    refinement_for_support)
 from .appearance import _correlation_peaks
 from .axes import transpose_image, transpose_matrix, transpose_config, transpose_prediction
-from .layout import _quality, _template_spacings, solve_layout
+from .layout import _quality, _template_spacings, is_partial_reference, shared_foreground, solve_layout
 
 
 @dataclass
@@ -27,10 +28,11 @@ class ObjectPrediction:
     identities: LabelMap
     valid: BoolMask
     diagnostics: Diagnostics
+    semantic_foreground: BoolMask | None = None
 
 
-def refine_object_transform(image, mask, source_valid, target, target_valid, matrix, cfg):
-    """Refine an already identified occurrence, bounded to its local neighborhood."""
+def _refinement_features(image, source_valid, target, target_valid, cfg):
+    """Invariant working images for one source/target pair."""
     scale = cfg.matching_scale(target.shape, image.shape)
     ss = (round(image.shape[1]*scale), round(image.shape[0]*scale))
     ts = (round(target.shape[1]*scale), round(target.shape[0]*scale))
@@ -39,17 +41,33 @@ def refine_object_transform(image, mask, source_valid, target, target_valid, mat
     sg, sm = ValidRegion.resize_for_matching(to_gray(image), source_valid, ss)
     tg, tm = ValidRegion.resize_for_matching(to_gray(target), target_valid, ts)
     src, dst = _features(sg, sm), _features(tg, tm)
+    return ts, Da, Db, src, dst, tm
+
+
+def refine_object_transform(image, mask, source_valid, target, target_valid, matrix, cfg, *,
+                            _prepared=None, _target_refinement=None, _proposal=None):
+    """Refine an already identified occurrence, bounded to its local neighborhood."""
+    ts, Da, Db, src, dst, tm = (_refinement_features(image, source_valid, target, target_valid, cfg)
+                               if _prepared is None else _prepared)
+    scale = cfg.matching_scale(target.shape, image.shape)
     observed = warp_valid_mask(mask, matrix, target.shape)
     local = cv2.resize(observed.astype(np.uint8), ts, interpolation=cv2.INTER_NEAREST)
     local = cv2.dilate(local, np.ones((9, 9), np.uint8)) & tm
     dst = (*dst[:3], local)
     work = Db @ matrix @ np.linalg.inv(Da)
     config = replace(cfg, min_overlap=.2)
-    before = _score(src, dst, work, config)
-    refined, converged = _refine(src, dst, work, config)
-    if not converged:
+    proposal = ScoreWarp(src, work, ts)
+    before = _score(src, dst, work, config, warped=proposal)
+    refinement = (None if _target_refinement is None
+                  else refinement_for_support(_target_refinement, local))
+    if _proposal is None:
+        refined, converged = _refine(src, dst, work, config, prepared=refinement, initial_warp=proposal)
+    else:
+        # A verified alias offers a transform, not an acceptance exemption.
+        # All original local score/displacement conditions below still apply.
+        refined, converged = Db @ _proposal @ np.linalg.inv(Da), True
+    if not converged or np.array_equal(work, refined):
         return matrix
-    after = _score(src, dst, refined, config)
     ys, xs = np.where(mask > 0)
     if not len(xs):
         return matrix
@@ -58,7 +76,12 @@ def refine_object_transform(image, mask, source_valid, target, target_valid, mat
     candidate = np.linalg.inv(Db) @ refined @ Da
     displacement = np.linalg.norm(cv2.perspectiveTransform(points, candidate)
                                   - cv2.perspectiveTransform(points, matrix), axis=2)
-    if (displacement.max()*scale <= 6 and after['structure_ncc'] > before['structure_ncc'] + .001
+    # A rejected geometric proposal cannot be rescued by its score. Preserve
+    # the exact <= test (including NaN rejection) before expensive edge scoring.
+    if not displacement.max()*scale <= 6:
+        return matrix
+    after = _score(src, dst, refined, config)
+    if (after['structure_ncc'] > before['structure_ncc'] + .001
             and after['edge_alignment'] >= before['edge_alignment']
             and after['match_score'] > before['match_score']):
         return candidate
@@ -107,14 +130,30 @@ def match_ordered_objects(
     ts = (round(shape[1]*scale), round(shape[0]*scale))
     Db = np.diag([ts[0]/shape[1], ts[1]/shape[0], 1.])
     tg, tm = ValidRegion.resize_for_matching(to_gray(target), target_valid, ts)
-    tf = _features(tg, tm)[0]
+    target_features = _features(tg, tm)
+    tf = target_features[0]
+    target_roi = target_valid > 0
+    source_features = {}
+    source_masks = {}
+    refinement_features = {}
+    refinement_targets = {}
     pools = {name: [] for name in cycle}
     for ti, image, refs, source_valid, initial in _reference_hypotheses(
             images, references, source_valids, matrices, cfg):
         ss = (round(image.shape[1]*scale), round(image.shape[0]*scale))
         Da = np.diag([ss[0]/image.shape[1], ss[1]/image.shape[0], 1.])
-        sg, sm = ValidRegion.resize_for_matching(to_gray(image), source_valid, ss)
-        sf = _features(sg, sm)[0]
+        if ti not in source_features:
+            sg, sm = ValidRegion.resize_for_matching(to_gray(image), source_valid, ss)
+            source_features[ti] = _features(sg, sm)
+            source_masks[ti] = sm
+            # Local refinement historically uses the pair's matching scale.
+            # Reuse only when identical; differently sized templates must keep
+            # their original pairwise resolution and coordinate matrices.
+            if cfg.matching_scale(target.shape, image.shape) == scale:
+                refinement_features[ti] = ts, Da, Db, source_features[ti], target_features, tm
+        # Feature extraction erodes its safety mask. Appearance visibility
+        # and local context need the original resized ROI.
+        sf, sm = source_features[ti][0], source_masks[ti]
         linear = Db @ np.asarray(initial) @ np.linalg.inv(Da)
         linear[:2, 2] = 0
         corners = cv2.perspectiveTransform(np.array([[[0., 0.], [ss[0]-1., 0.],
@@ -137,19 +176,22 @@ def match_ordered_objects(
             x0, x1, y0, y1 = xx.min(), xx.max()+1, yy.min(), yy.max()+1
             patch, weight = aligned[y0:y1, x0:x1], context[y0:y1, x0:x1]
             raw_ys, raw_xs = np.where(raw > 0)
-            reference_partial = (raw_xs.min() < 2 or raw_xs.max() >= image.shape[1]-2)
+            raw_pixels = float(len(raw_xs))
+            raw_height = raw_ys.max()-raw_ys.min()+1
+            reference_partial = is_partial_reference(ref, int(raw_xs.min()), int(raw_xs.max()), image.shape[1])
             center = np.array([[[float((raw_xs.min()+raw_xs.max())/2),
                                 float((raw_ys.min()+raw_ys.max())/2)]]], np.float32)
             for score, dx, dy in _correlation_peaks(patch, weight, tf, tm, cfg):
                 shift = np.eye(3)
                 shift[:2, 2] = [dx-x0, dy-y0]
                 H = np.linalg.inv(Db) @ shift @ linear @ Da
-                visible = warp_valid_mask(raw, H, target.shape) & (target_valid > 0)
-                fraction = min(1., float(visible.sum()/max(float(raw.sum())*abs(np.linalg.det(H[:2, :2])), 1)))
-                if fraction < cfg.object_min_visible or visible.sum() < 64:
+                visible = warp_valid_mask(raw, H, target.shape) & target_roi
+                visible_pixels = visible.sum()
+                fraction = min(1., float(visible_pixels/max(raw_pixels*abs(np.linalg.det(H[:2, :2])), 1)))
+                if fraction < cfg.object_min_visible or visible_pixels < 64:
                     continue
                 vertical_fraction = min(1., float(np.any(visible, axis=1).sum()/max(
-                    (raw_ys.max()-raw_ys.min()+1)*np.linalg.norm(H[:2, 1]), 1)))
+                    raw_height*np.linalg.norm(H[:2, 1]), 1)))
                 cx = float(cv2.perspectiveTransform(center, H)[0, 0, 0])
                 pools[ref['identity']].append(dict(identity=ref['identity'], template_index=ti,
                     reference_index=ri, shape_index=ref.get('shape_index', ri), score=score,
@@ -158,7 +200,6 @@ def match_ordered_objects(
                     vertical_fraction=vertical_fraction,
                     horizontal_fraction=min(1., fraction/max(vertical_fraction, 1e-6)),
                     matrix_template_to_target=H.tolist(), _mask=visible,
-                    _support=warp_valid_mask(source_valid, H, target.shape),
                     _background_known=ref.get('background_known', True)))
     # Partial references can establish spacing through locally verified poses,
     # even if their whole-image registration was rejected.
@@ -198,8 +239,14 @@ def match_ordered_objects(
                 proposed_objects=[{k: v for k, v in c.items() if not k.startswith('_')} for c in chosen])
     if margin is not None and margin < cfg.object_min_gap:
         info['status'] = 'ambiguous_identity'
-        return ObjectPrediction(labels, identities, known, info)
+        semantic = None
+        if cfg.object_visible_count is not None:
+            semantic = shared_foreground(groups, cfg.object_min_gap)
+            info['semantic_consensus_pixels'] = int(semantic.sum())
+        return ObjectPrediction(labels, identities, known, info, semantic)
     info['status'] = 'accepted'
+    if cfg.shared_periods:
+        info.update(periodic_refinement_reuses=0, periodic_refinement_fallbacks=0)
     known = target_valid > 0
     for chosen_object in chosen:
         name = chosen_object['identity']
@@ -207,23 +254,59 @@ def match_ordered_objects(
                     and c['score'] >= chosen_object['score']-.025]
         combined = np.zeros(shape, bool)
         support = np.zeros(shape, bool)
+        periodic_refinements = {}
         for candidate in selected:
+            ti = candidate['template_index']
             if cfg.object_visible_count is not None:
                 ti, ri = candidate['template_index'], candidate['reference_index']
                 raw = ((references[ti][ri]['mask'] > 0) & (source_valids[ti] > 0)).astype(np.uint8)
                 initial = np.asarray(candidate['matrix_template_to_target'])
-                refined = refine_object_transform(images[ti], raw, source_valids[ti], target,
-                                                  target_valid, initial, cfg)
+                if ti not in refinement_features:
+                    refinement_features[ti] = _refinement_features(images[ti], source_valids[ti], target, target_valid, cfg)
+                pair_features = refinement_features[ti]
+                target_key = id(pair_features[4][0])
+                if target_key not in refinement_targets:
+                    refinement_targets[target_key] = prepare_refinement_target(pair_features[4])
+                refined = initial
+                alias_key = ti, ri
+                if cfg.shared_periods and alias_key in periodic_refinements:
+                    anchor, adjusted = periodic_refinements[alias_key]
+                    if np.array_equal(anchor[:2, :2], initial[:2, :2]):
+                        source_shift = np.linalg.solve(anchor[:2, :2], initial[:2, 2]-anchor[:2, 2])
+                        if np.linalg.norm(source_shift)*scale >= 12 and cfg.allows_periodic_shift(
+                                cfg.ordered_object_class, [source_shift]):
+                            translation = np.eye(3)
+                            translation[:2, 2] = pair_features[1][:2, :2] @ source_shift
+                            evidence = _score(pair_features[3], pair_features[3], translation,
+                                              replace(cfg, min_overlap=.2))
+                            if (evidence['structure_ncc'] >= cfg.periodic_min_ncc
+                                    and evidence['edge_alignment'] >= cfg.periodic_min_edge):
+                                shared = adjusted @ np.linalg.inv(anchor) @ initial
+                                refined = refine_object_transform(images[ti], raw, source_valids[ti], target,
+                                    target_valid, initial, cfg, _prepared=pair_features,
+                                    _target_refinement=refinement_targets[target_key], _proposal=shared)
+                                if not np.array_equal(initial, refined):
+                                    info['periodic_refinement_reuses'] += 1
+                if np.array_equal(initial, refined):
+                    refined = refine_object_transform(images[ti], raw, source_valids[ti], target,
+                        target_valid, initial, cfg, _prepared=pair_features,
+                        _target_refinement=refinement_targets[target_key])
+                    if cfg.shared_periods:
+                        info['periodic_refinement_fallbacks'] += 1
+                if cfg.shared_periods and not np.array_equal(initial, refined) and alias_key not in periodic_refinements:
+                    periodic_refinements[alias_key] = initial.copy(), refined.copy()
                 candidate['local_refined'] = not np.array_equal(initial, refined)
                 candidate['matrix_template_to_target'] = refined.tolist()
                 yy, xx = np.where(raw > 0)
                 center = np.array([[[float((xx.min()+xx.max())/2),
                                     float((yy.min()+yy.max())/2)]]], np.float32)
                 candidate['center_x'] = float(cv2.perspectiveTransform(center, refined)[0, 0, 0])
-                candidate['_mask'] = warp_valid_mask(raw, refined, target.shape) & (target_valid > 0)
-                candidate['_support'] = warp_valid_mask(source_valids[ti], refined, target.shape)
+                if candidate['local_refined']:
+                    candidate['_mask'] = warp_valid_mask(raw, refined, target.shape) & target_roi
             combined |= candidate['_mask']
-            support |= candidate['_support']
+            # Layout selection never uses source background support. Project it
+            # only for the selected occurrences, after any local refinement.
+            support |= warp_valid_mask(source_valids[ti], candidate['matrix_template_to_target'], target.shape)
         # Missing vertical source support cannot be invented at target boundaries.
         ys, xs = np.where(combined)
         band = np.zeros(shape, bool)

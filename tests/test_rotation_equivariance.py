@@ -14,7 +14,7 @@ from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher, ru
 from periodic_template_matcher._internal.io.annotations import load_labels, load_objects
 from periodic_template_matcher._internal.objects.completion import complete_object_support
 from periodic_template_matcher._internal.objects.matching import ObjectPrediction, match_ordered_objects
-from periodic_template_matcher.utils import read_image, write_image, warp_valid_mask
+from periodic_template_matcher.utils import ValidRegion, read_image, write_image, warp_valid_mask
 from tests import test_object_completion
 from tests.test_ordered_objects import scene
 from tests.test_periodic_completion import selection
@@ -172,20 +172,17 @@ class RotationEquivarianceTests(unittest.TestCase):
         resolve = lambda value: (CONFIG.parent/value).resolve()
         if not all(resolve(s['image']).exists() and resolve(s['labelme']).exists() for s in spec['templates']):
             self.skipTest('Optional SD-1 source assets not available')
-        cfg = replace(MatcherConfig.from_options(spec['options']), valid_height=None)
+        region_config = MatcherConfig.from_options(spec['options'])
+        cfg = region_config.without_valid_region()
         if cfg.ordered_object_class != 2 or any(s['instance_layouts']['2']['order_axis'] != 'x' for s in spec['templates']):
             self.skipTest('This fixture expects the SD-1 horizontal baseline configuration')
         images = [read_image(resolve(s['image'])) for s in spec['templates']]
         target = read_image(resolve(spec['target']))
         labels = [load_labels(s, resolve, im.shape[:2]) for s, im in zip(spec['templates'], images)]
         refs = [load_objects(s, resolve, im.shape[:2], 2, cfg.object_cycle) for s, im in zip(spec['templates'], images)]
-        valids = []
-        for item, image in zip(spec['templates'], images):
-            valid = np.zeros(image.shape[:2], np.uint8)
-            valid[:item['valid_height']] = 1
-            valids.append(valid)
-        tv = np.zeros(target.shape[:2], np.uint8)
-        tv[:spec['target_valid_height']] = 1
+        valids = [ValidRegion.from_config(region_config, item.get('valid_height')).build_mask(image)
+                  for item, image in zip(spec['templates'], images)]
+        tv = ValidRegion.from_config(region_config, spec.get('target_valid_height')).build_mask(target)
         baseline = PeriodicTemplateMatcher(cfg).match(images, labels, target, template_valids=valids,
                                                     target_valid=tv, template_objects=refs)
         self.assertTrue(baseline.accepted)

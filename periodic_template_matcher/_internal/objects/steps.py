@@ -8,8 +8,9 @@ import numpy as np
 from ...config import MatcherConfig
 from ...utils.types import Mask
 from ..models import PreparedInputs, RegisteredMatch
-from .completion import complete_object_support
+from .completion import complete_object_support, support_vectors
 from .matching import ObjectPrediction, match_ordered_objects
+from .retry import retry_cropped_identity
 
 
 @dataclass
@@ -58,18 +59,45 @@ class OrderedObjectStep:
 class ObjectSupportCompletionStep:
     """Use approved lattice geometry, never unconditional periodic instance copies."""
 
-    def __init__(self, completer: Callable[..., None] = complete_object_support) -> None:
+    def __init__(self, completer: Callable[..., None] = complete_object_support, *,
+                 locator: Callable[..., ObjectPrediction] = match_ordered_objects) -> None:
         self.completer = completer
+        self.locator = locator
 
     def run(self, inputs: PreparedInputs, match: RegisteredMatch,
             located: LocatedObjects, config: MatcherConfig) -> None:
         periodic = match.result.registration.get('periodic_completion', {})
         # Geometry approval differs from label-copy acceptance. The object kernel
         # independently validates every actual support fill, including occlusion.
-        if not any(c.get('geometry_accepted', c.get('accepted')) for c in periodic.get('copies', [])):
+        approved = [c for c in periodic.get('copies', []) if c.get('geometry_accepted', c.get('accepted'))]
+        if not approved:
             return
         assert match.matrix is not None
         target_vectors = [(match.matrix[:2, :2] @ np.asarray(v)).tolist()
                           for v in periodic.get('period_vectors', [])]
+        source_vectors = periodic.get('period_vectors', [])
+        lattice = periodic.get('lattice', []) if config.shared_periods else []
+        if lattice and len(lattice) == len(target_vectors):
+            target_vectors = [axis['target_vector'] for axis in lattice]
+            # Keep source-axis provenance: a source-y period may be diagonal in
+            # the target after affine registration. This is geometry, not a new identity.
+            located.prediction.diagnostics['periodic_lattice'] = lattice
+        if (config.object_visible_count is not None
+                and located.prediction.diagnostics.get('status') == 'ambiguous_identity'
+                and (inputs.original_templates is not None or inputs.original_target is not None)):
+            # An approved copy in the order direction cannot justify a perpendicular retry.
+            shifts = [np.asarray(copy['offset']) @ target_vectors for copy in approved
+                      if target_vectors and len(copy.get('offset', ())) == len(target_vectors)]
+            source_shifts = [np.asarray(copy['offset']) @ source_vectors for copy in approved
+                             if source_vectors and len(copy.get('offset', ())) == len(source_vectors)]
+            if support_vectors(shifts, config, source_vectors=source_shifts if lattice else None):
+                located.prediction = retry_cropped_identity(inputs, match, located, config, self.locator)
+                match.result.registration['ordered_objects'] = located.prediction.diagnostics
+                if lattice:
+                    located.prediction.diagnostics['periodic_lattice'] = lattice
+        if lattice:
+            # Source vectors belong to this exact selected template, not every
+            # alternate reference with the same semantic identity.
+            located.prediction.diagnostics['periodic_lattice_template_index'] = match.template_index
         self.completer(located.prediction, inputs.templates, inputs.objects, located.source_valids,
                        inputs.target, inputs.target_valid, target_vectors, config)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 import os
 
@@ -21,7 +22,7 @@ from ...utils.types import Diagnostics, Image, Mask, Matrix, Shape, Size
 # Retain existing helper imports for callers of the original core module.
 from .correlation import _corr, _periods, _translation_peaks
 from .opencv import translation_peaks as opencv_translation_peaks
-from .scoring import Features, _ncc, _refine, _score
+from .scoring import Features, RefinementLevel, ScoreWarp, _ncc, _refine, _score, prepare_refinement_target
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,29 @@ class PreparedImage:
     to_work: Matrix
     scale: float
     features: Features | None
+
+
+@dataclass(frozen=True)
+class RegistrationTarget:
+    image: PreparedImage
+    lattice: list[Diagnostics]
+    refinement: tuple[RefinementLevel, ...] | None
+
+
+def prepare_registration_target(target: Image, valid: Mask | None, cfg: MatcherConfig,
+                                scale: float) -> RegistrationTarget:
+    destination = _prepare_image(target, valid, cfg, scale)
+    features = destination.features
+    lattice = _periods(features[0], features[3]) if features is not None else []
+    refinement = prepare_refinement_target(features) if features is not None else None
+    return RegistrationTarget(destination, lattice, refinement)
+
+
+def prepare_registration_sources(templates: Sequence[Image], valids: Sequence[Mask | None],
+                                 cfg: MatcherConfig, scale: float) -> tuple[PreparedImage, ...]:
+    if cv2.getNumThreads() != 2:
+        cv2.setNumThreads(2)
+    return tuple(_prepare_image(image, valid, cfg, scale) for image, valid in zip(templates, valids))
 
 
 def _prepare_image(image: Image, valid: Mask | None, cfg: MatcherConfig,
@@ -93,9 +117,8 @@ def register(template: Image, target: Image, cfg: MatcherConfig | None = None,
     cfg.validate()
     scale = cfg.matching_scale(template.shape, target.shape) if working_scale is None else working_scale
     source = _prepare_image(template, template_valid, cfg, scale)
-    destination = _prepare_image(target, target_valid, cfg, scale)
-    lattice = _periods(destination.features[0], destination.features[3]) if destination.features is not None else []
-    return _register_prepared(source, destination, cfg, lattice)
+    destination = prepare_registration_target(target, target_valid, cfg, scale)
+    return _register_prepared(source, destination.image, cfg, destination.lattice, destination.refinement)
 
 
 def _coarse_candidates(src: Features, dst: Features, cfg: MatcherConfig) -> list[Matrix]:
@@ -121,16 +144,18 @@ def _coarse_candidates(src: Features, dst: Features, cfg: MatcherConfig) -> list
 
 
 def _refine_candidates(source: PreparedImage, target: PreparedImage,
-                       cfg: MatcherConfig) -> list[Diagnostics]:
+                       cfg: MatcherConfig, prepared: tuple[RefinementLevel, ...]) -> list[Diagnostics]:
     """Refine, score and deduplicate candidates; retain original-coordinate matrices."""
     src, dst = source.features, target.features
     assert src is not None and dst is not None
     candidates = []
     to_original = np.linalg.inv(target.to_work)
+    size = (target.shape[1], target.shape[0])
     for H in _coarse_candidates(src, dst, cfg):
-        metrics = _score(src, dst, H, cfg)
-        refined, ecc_ok = _refine(src, dst, H, cfg)
-        refined_metrics = _score(src, dst, refined, cfg)
+        warp = ScoreWarp(src, H, size)
+        metrics = _score(src, dst, H, cfg, warped=warp)
+        refined, ecc_ok = _refine(src, dst, H, cfg, prepared=prepared, initial_warp=warp)
+        refined_metrics = metrics if np.array_equal(refined, H) else _score(src, dst, refined, cfg)
         if refined_metrics['match_score'] >= metrics['match_score']:
             H, metrics = refined, refined_metrics
         else:
@@ -143,7 +168,8 @@ def _refine_candidates(source: PreparedImage, target: PreparedImage,
 
 
 def _register_prepared(source: PreparedImage, target: PreparedImage,
-                       cfg: MatcherConfig, lattice: list[Diagnostics]) -> Diagnostics:
+                       cfg: MatcherConfig, lattice: list[Diagnostics],
+                       refinement: tuple[RefinementLevel, ...] | None = None) -> Diagnostics:
     """Match prepared images without repeating boundary validation or preprocessing."""
     size = [target.shape[1], target.shape[0]]
     fail = dict(match_score=0.0, geometry_accepted=False, absolute_cell_verified=False,
@@ -152,7 +178,9 @@ def _register_prepared(source: PreparedImage, target: PreparedImage,
                 reasons=['insufficient_texture_or_overlap'])
     if source.features is None or target.features is None:
         return fail
-    candidates = _refine_candidates(source, target, cfg)
+    if refinement is None:
+        refinement = prepare_refinement_target(target.features)
+    candidates = _refine_candidates(source, target, cfg, refinement)
     if not candidates:
         return fail
     candidates.sort(key=lambda c: c['match_score'], reverse=True)
@@ -187,7 +215,9 @@ def select_templates(templates: Sequence[Image], target: Image,
                      cfg: MatcherConfig | None = None,
                      template_valids: Sequence[Mask | None] | None = None,
                      target_valid: Mask | None = None,
-                     label_mode: str = 'semantic') -> Diagnostics:
+                     label_mode: str = 'semantic', *,
+                     _prepared_sources: Sequence[PreparedImage] | None = None,
+                     _prepared_target: RegistrationTarget | None = None) -> Diagnostics:
     """Rank templates on the same target ROI, scale and score definition.
 
     semantic allows shared cell classes; instance requires verified identity.
@@ -202,15 +232,17 @@ def select_templates(templates: Sequence[Image], target: Image,
     if len(template_valids) != len(templates):
         raise ValueError('One valid mask per template is required')
     cv2.setRNGSeed(cfg.seed)
-    cv2.setNumThreads(2)
+    if cv2.getNumThreads() != 2:
+        cv2.setNumThreads(2)
     common_scale = cfg.matching_scale(*(im.shape for im in [*templates, target]))
-    destination = _prepare_image(target, target_valid, cfg, common_scale)
-    lattice = _periods(destination.features[0], destination.features[3]) if destination.features is not None else []
+    prepared = _prepared_target or prepare_registration_target(target, target_valid, cfg, common_scale)
+    lattice = deepcopy(prepared.lattice) if _prepared_target is not None else prepared.lattice
 
     def match_one(i: int) -> Diagnostics:
         template, valid = templates[i], template_valids[i]
-        source = _prepare_image(template, valid, cfg, common_scale)
-        result = _register_prepared(source, destination, cfg, lattice)
+        source = (_prepare_image(template, valid, cfg, common_scale)
+                  if _prepared_sources is None else _prepared_sources[i])
+        result = _register_prepared(source, prepared.image, cfg, lattice, prepared.refinement)
         result['template_index'] = i
         return result
 
