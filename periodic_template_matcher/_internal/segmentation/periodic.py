@@ -60,10 +60,12 @@ def _candidate_fill(mapped: LabelMap, annotation: BoolMask, target: Mask,
     fill = unknown.copy()
     seeds = unknown & (mapped > 0)
     for class_id in np.unique(mapped[seeds]):
-        _, components = cv2.connectedComponents(((mapped == class_id) & eligible).astype(np.uint8))
-        seeded = np.unique(components[seeds & (mapped == class_id)])
-        component = np.isin(components, seeded[seeded != 0])
-        fill |= component & known & (labels == 0)
+        class_mask = mapped == class_id
+        count, components = cv2.connectedComponents((class_mask & eligible).astype(np.uint8))
+        seeded = np.zeros(count, bool)
+        seeded[components[seeds & class_mask]] = True
+        seeded[0] = False
+        fill |= seeded[components] & known & (labels == 0)
     return fill
 
 
@@ -256,7 +258,8 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         # translated background cannot prove a nonperiodic class is absent.
         # Keep such negative knowledge unknown; approved foreground of another
         # class can still establish a positive label at its actual source pixels.
-        eligible = np.isin(mapped, sorted(allowed))
+        eligible = (mapped == next(iter(allowed)) if len(allowed) == 1
+                    else np.isin(mapped, sorted(allowed)))
         if not blocked:
             eligible |= mapped == 0
         ann &= eligible
@@ -272,7 +275,8 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
             local = resize_region(region)
             local = cv2.dilate(local, np.ones((25, 25), np.uint8)) & dst[3]
             local_dst = (dst[0], dst[1], dst[2], local)
-            local_metrics = _score(src, local_dst, candidate_work, local_cfg, warped=score_warp)
+            local_metrics = _score(src, local_dst, candidate_work, local_cfg, warped=score_warp,
+                                   min_structure_ncc=cfg.periodic_min_ncc)
             local_ok = (local_metrics['structure_ncc'] >= cfg.periodic_min_ncc
                         and local_metrics['edge_alignment'] >= cfg.periodic_min_edge)
             record['local_regions'].append(dict(accepted=bool(local_ok), pixels=region.pixels, metrics=local_metrics))
@@ -287,12 +291,14 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         result.mapped_labels[fill_labels] = mapped[fill_labels]
         result.label_valid |= fill_labels
         result.label_periodic_valid |= fill_labels
-        geom = warp_valid_mask(source_valid, candidate, target.shape)
-        fill_image = geom & target_valid & ~result.completed_valid & approved
-        warped = cv2.warpPerspective(source, candidate, (w, h))
-        result.completed_template[fill_image] = warped[fill_image]
-        result.completed_valid |= fill_image
-        result.periodic_valid |= fill_image
+        fill_image = approved & ~result.completed_valid
+        if fill_image.any():
+            fill_image &= warp_valid_mask(source_valid, candidate, target.shape)
+            if fill_image.any():
+                warped = cv2.warpPerspective(source, candidate, (w, h))
+                result.completed_template[fill_image] = warped[fill_image]
+                result.completed_valid |= fill_image
+                result.periodic_valid |= fill_image
         record['added_label_pixels'] = int(fill_labels.sum())
         if result.label_valid[target_valid].all() and not (cfg.shared_periods and needs_object_geometry):
             break

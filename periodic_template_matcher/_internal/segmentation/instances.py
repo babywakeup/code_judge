@@ -18,11 +18,13 @@ from .reference_instances import complete_reference_instances
 from .regions import MaskRegion, RegionResize
 
 
-def complete_periodic_instances(result, target_valid, cfg, *, reference=None):
+def complete_periodic_instances(result, target_valid, cfg, *, reference=None, alternate_references=()):
     """Verify observed contours first, then independent source annotations."""
     _complete_observed_instances(result, target_valid, cfg)
     if reference is not None:
         complete_reference_instances(result, target_valid, cfg, **reference)
+    for alternate in alternate_references:
+        complete_reference_instances(result, target_valid, cfg, **alternate)
 
 
 def _complete_observed_instances(result, target_valid, cfg):

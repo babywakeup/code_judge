@@ -68,10 +68,15 @@ class MatchPipeline:
         if located is not None:
             self.object_support.run(inputs, match, located, self.config)
             self.fusion.run(inputs, match, located, self.config)
+        alternates = (dict(labels=inputs.labels[index], annotation_valid=inputs.annotation_valids[index],
+                           source_valid=inputs.template_valids[index], template_index=index,
+                           source_image=inputs.templates[index])
+                      for index in result.registration['ranking']
+                      if index != match.template_index and inputs.labels[index] is not None)
         complete_periodic_instances(match.result, inputs.target_roi, self.config,
             reference=dict(labels=transferred.labels, annotation_valid=transferred.annotation_valid,
                            source_valid=inputs.template_valids[match.template_index],
-                           template_index=match.template_index))
+                           template_index=match.template_index), alternate_references=alternates)
         # Late, independently verified semantic repairs are also completion
         # evidence. Do not clear the pre-fusion evidence under object positives.
         if result.completion_valid is not None:

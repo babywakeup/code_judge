@@ -102,6 +102,34 @@ class ObjectSupportAnchorTests(unittest.TestCase):
         self.assertTrue(data[4].valid[100:200, 26:54].all())
         self.assertFalse(data[4].valid[100:200, 20:26].any())
 
+    def test_clipped_end_requires_independently_bridged_same_identity_repeat(self):
+        data = self.fixture()
+        self.erase(data[4], 0, 200)
+        # Keep a healthy strip between the open end and a separately
+        # bracketed interior defect exactly one period away.
+        for lo, hi in ((55, 100), (155, 200)):
+            data[4].labels[lo:hi] = data[3][lo:hi]
+            data[4].identities[lo:hi] = (data[3][lo:hi] == 2).astype(np.uint16)
+            data[4].valid[lo:hi] = True
+        data[1][:55, 26:54] = 100
+        data[1][100:155, 26:54] = 100
+        self.run_support(data)
+        np.testing.assert_array_equal(data[4].labels, data[3])
+        self.assertGreater(data[4].diagnostics['support_completion']['clipped_bridge_pixels'], 0)
+        json.dumps(data[4].diagnostics, allow_nan=False)
+
+    def test_two_verified_ends_can_recover_projected_background(self):
+        mapped, p, observed, target = self.bridge_fixture()
+        p.valid[80:160, 20:80] = True
+        p.identities[80:160, 100:104] = 2
+        target[80:160, 20:80] = 100
+        bridge, records = interior_bridges(mapped, p, 1, observed, target,
+            np.zeros(mapped.shape, bool), 100, 40, lambda region, ncc: {} if ncc > .9 else None,
+            include_background=True)
+        self.assertTrue(bridge[80:160, 20:80].all())
+        self.assertFalse(bridge[:, 100:104].any())
+        self.assertEqual(len(records), 1)
+
     def test_partial_primary_does_not_hide_complete_supporting_reference(self):
         data = self.fixture()
         self.erase(data[4], 100, 200)

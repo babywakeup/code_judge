@@ -8,6 +8,28 @@ from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher
 
 
 class MultiSourceCompletionTests(unittest.TestCase):
+    def test_alternate_recovers_discrete_foreground_inside_known_background(self):
+        rng = np.random.default_rng(27)
+        target = cv2.GaussianBlur(rng.integers(10, 240, (192, 240), dtype=np.uint8), (5, 5), 1)
+        alternate = target.copy()
+        alternate[96:, 144:] = np.flipud(alternate[96:, 144:])
+        primary = np.zeros(target.shape, np.uint16)
+        primary[105:135, 30:60] = 3
+        labels = np.zeros_like(primary)
+        labels[30:62, 40:72] = 1
+        labels[105:135, 30:60] = 1
+        labels[130:162, 175:207] = 1
+        cfg = MatcherConfig(periodic_completion=True, shared_periods=True)
+        registration = dict(accepted=True, status='accepted', best_template_index=0, ranking=[0, 1],
+            matches=[dict(template_index=i, match_score=90-i, geometry_accepted=True,
+                matrix_template_to_target=np.eye(3).tolist()) for i in range(2)])
+        with patch('periodic_template_matcher.matcher.select_templates', return_value=registration):
+            result = PeriodicTemplateMatcher(cfg).match([target, alternate], [primary, labels], target)
+        np.testing.assert_array_equal(result.mapped_labels[30:62, 40:72], 1)
+        np.testing.assert_array_equal(result.mapped_labels[105:135, 30:60], 3)
+        np.testing.assert_array_equal(result.mapped_labels[130:162, 175:207], 0)
+        np.testing.assert_array_equal(result.direct_labels, primary)
+
     def test_verified_partial_identity_foreground_overrides_base_phase(self):
         from periodic_template_matcher._internal.models import MatchResult, RegisteredMatch, PreparedInputs
         from periodic_template_matcher._internal.objects.matching import ObjectPrediction

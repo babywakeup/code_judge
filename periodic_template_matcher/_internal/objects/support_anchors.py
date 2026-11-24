@@ -69,6 +69,7 @@ def canonical_support_objects(prediction, images, references, source_valids, vec
             if axis is None:
                 continue
             best = None
+            bridge_only = None
             seen = set()
             for anchor in anchors:
                 if anchor is obj and obj.get('reference_partial', False):
@@ -120,12 +121,16 @@ def canonical_support_objects(prediction, images, references, source_valids, vec
                     known = mask & valid
                     own = known & (labels == identity)
                     count = int(own.sum())
-                    if count < 64 or count < cfg.object_min_score*int(known.sum()):
+                    if count < 64:
+                        continue
+                    sparse = count < cfg.object_min_score*int(known.sum())
+                    if sparse and (known & (labels > 0) & (labels != identity)).any():
                         continue
                     observed = cv2.warpPerspective(gray, D @ H, size)
                     ncc = _ncc(observed[own].astype(np.float32), target[own].astype(np.float32))
                     quality = ncc, count/max(int(known.sum()), 1), count
-                    if best is None or quality > best[0]:
+                    selected = bridge_only if sparse else best
+                    if selected is None or quality > selected[0]:
                         # Do not inherit source-specific metadata or mutable lists
                         # from a primary reference in a DIFFERENT template.
                         record = dict(identity=obj['identity'], template_index=ti, reference_index=ri,
@@ -133,77 +138,184 @@ def canonical_support_objects(prediction, images, references, source_valids, vec
                                       matrix_template_to_target=H.tolist(),
                                       support_anchor=dict(offset=offset, target_vector=vector.tolist(),
                                           lattice_constrained=constrained, known_ncc=ncc, known_pixels=count))
-                        best = quality, record
+                        if sparse:
+                            # Blank pixels transferred from a partial occurrence
+                            # are weaker than two locally verified foreground ends.
+                            record['support_anchor']['bridge_only'] = True
+                            bridge_only = quality, record
+                        else:
+                            best = quality, record
+            if best is None:
+                best = bridge_only
             if best is not None:
                 result.append(best[1])
     return result
 
 
 def interior_bridges(mapped, prediction, identity, observed, target_gray, occluded,
-                     max_gap, anchor_height, verify):
+                     max_gap, anchor_height, verify, *, phase_retry=False,
+                     include_background=False, clipped_candidates=None, columns=slice(None)):
     """Bridge a connected source contour only between independently good ends.
 
     The missing interior is NOT declared appearance-matched. Both bracketing
     strips must pass the unchanged pixel-NCC, structural-NCC and edge gates.
-    Only foreground is transferred; open ends, other identities, background and
-    disconnected source components cannot be inferred by this rule.
+    A clipped end with a verified inner anchor may be recorded separately for
+    corroboration by another occurrence. It is never approved here.
     """
     approved = np.zeros(mapped.shape, bool)
     records = []
-    for component in component_regions(mapped > 0):
+    x_offset = int(columns.start or 0)
+    for local_component in component_regions(mapped[:, columns] > 0):
+        component = MaskRegion(local_component.y, local_component.x + x_offset, local_component.mask)
         slices = component.slices
         own = ((prediction.identities[slices] == identity) & prediction.valid[slices])
-        missing = component.mask & ~prediction.valid[slices]
+        missing = component.mask & (prediction.identities[slices] == 0 if include_background
+                                    else ~prediction.valid[slices])
         # Inspect actual pixel holes, not whole-image row occupancy. A surviving
         # pixel elsewhere in the row cannot hide a local missing contour.
         for gap in component_regions(missing):
             start, end = gap.y, gap.y+gap.mask.shape[0]
             left, right = gap.x, gap.x+gap.mask.shape[1]
-            if start == 0 or end == len(component.mask) or end-start > max_gap:
+            if end-start > max_gap or (phase_retry and gap.pixels < 64):
+                continue
+            clipped = 0
+            if clipped_candidates is not None and end-start >= anchor_height:
+                # A few surviving foreground pixels can separate a defect
+                # from the actual crop edge without forming a viable anchor.
+                margin = max(1, anchor_height // 8)
+                if component.y == 0 and start <= margin:
+                    clipped = -1
+                elif slices[0].stop == mapped.shape[0] and len(component.mask)-end <= margin:
+                    clipped = 1
+            if not clipped and (start == 0 or end == len(component.mask)):
                 continue
             anchors = []
             remaining = max_gap-(end-start)
-            for above in (True, False):
+            sides = (False, True) if clipped < 0 else (True, False)
+            for side, above in enumerate(sides, 1):
                 # The nearest confirmed mask can itself cross the appearance
                 # defect. Search OUTWARD for a healthy anchor, but keep the
                 # separation within one configured period budget. This is a
                 # bounded strip verification, never another image/ECC search.
-                for offset in range(0, int(remaining)+1, anchor_height):
+                stride = max(8, anchor_height // 2) if phase_retry else anchor_height
+                for offset in range(0, int(remaining)+1, stride):
                     lo = max(0, start-anchor_height-offset) if above else end+offset
                     hi = start-offset if above else min(len(component.mask), lo+anchor_height)
                     if lo >= hi:
                         break
-                    local = (slice(lo, hi), slice(left, right))
                     ys = slice(component.y+lo, component.y+hi)
-                    xs = slice(component.x+left, component.x+right)
-                    pixels = component.mask[local]
+                    # A curved contour can leave the gap's x extent before
+                    # reaching its healthy end. Follow the connected source
+                    # component within this strip.
+                    xs = slices[1]
+                    pixels = component.mask[lo:hi]
                     ids = prediction.identities[ys, xs]
                     # Do not jump over a conflicting identity to find a nicer
                     # patch further away in the same source component.
                     if (pixels & prediction.valid[ys, xs] & (ids > 0) & (ids != identity)).any():
                         break
-                    visible = pixels & own[local] & ~occluded[ys, xs]
+                    visible = pixels & own[lo:hi] & ~occluded[ys, xs]
                     a = observed[ys, xs][visible].astype(np.float32)
                     b = target_gray[ys, xs][visible].astype(np.float32)
                     if (len(a) < max(64, .5*int(pixels.sum())) or np.std(a) < 2 or np.std(b) < 2):
                         continue
-                    evidence = MaskRegion(component.y+lo, component.x+left, visible)
+                    evidence = MaskRegion(component.y+lo, component.x, visible)
                     metrics = verify(evidence, _ncc(a, b))
                     if metrics is None:
                         continue
-                    anchors.append(dict(target_bbox=[component.x+left, component.y+lo,
-                        component.x+right, component.y+hi], pixels=len(a), metrics=metrics))
+                    anchors.append(dict(target_bbox=[component.x, component.y+lo,
+                        xs.stop, component.y+hi], pixels=len(a), metrics=metrics))
                     remaining -= offset
                     break
-                if len(anchors) != (1 if above else 2):
+                if len(anchors) != side:
                     break
-            if len(anchors) != 2:
+            if len(anchors) != 2 and not (clipped and len(anchors) == 1):
                 continue
             # The SAME source component supplies both independently checked
             # ends. Never let a large matching island certify a smaller one.
             ys = slice(component.y+start, component.y+end)
             xs = slice(component.x+left, component.x+right)
+            if len(anchors) == 1:
+                clipped_candidates.append((MaskRegion(ys.start, xs.start, gap.mask), clipped, anchors[0]))
+                continue
             approved[ys, xs] |= gap.mask
+            if clipped < 0:
+                anchors.reverse()
             records.append(dict(target_bbox=[component.x+left, component.y+start,
                 component.x+right, component.y+end], pixels=gap.pixels, anchors=anchors))
+    return approved, records
+
+
+def corroborate_clipped_bridges(candidates, bridged, confirmed, identity, vector, tolerance):
+    """Corroborate one clipped end with a two-anchor bridge one period away."""
+    if not candidates or bridged is None:
+        return
+    seed = bridged.astype(np.uint8)
+    support = (bridged | (confirmed.valid & (confirmed.identities == identity))).astype(np.uint8)
+    kernel = np.ones((2*tolerance+1, 2*tolerance+1), np.uint8)
+    for region, step, anchor in candidates:
+        translation = np.eye(2, 3)
+        translation[:, 2] = step*vector - [region.x, region.y]
+        size = region.mask.shape[::-1]
+        adjacent_bridge = cv2.warpAffine(seed, translation, size, flags=cv2.INTER_NEAREST) > 0
+        if np.count_nonzero(region.mask & adjacent_bridge) < .5*region.pixels:
+            continue
+        adjacent = cv2.warpAffine(support, translation, size, flags=cv2.INTER_NEAREST)
+        # One working pixel accounts for rasterization and lattice residual.
+        agreed = region.mask & (cv2.dilate(adjacent, kernel) > 0)
+        if np.count_nonzero(agreed) >= .85*region.pixels:
+            yield MaskRegion(region.y, region.x, agreed), step, anchor
+
+
+def verified_repeat_regions(fill, mapped, confirmed, identity, gray, occluded, vector,
+                            tile_size, min_ncc, verify):
+    """Use a confirmed occurrence of the same identity as a second source.
+
+    Candidate pixels must agree with the canonical contour and the translated
+    label. Each copied region must also match the target's actual appearance.
+    """
+    approved = np.zeros_like(fill)
+    candidates = fill & (mapped > 0)
+    seed = ((confirmed.identities == identity) & confirmed.valid & ~occluded).astype(np.uint8)
+    records = []
+    for step in (-1, 1):
+        translation = np.eye(2, 3)
+        translation[:, 2] = step * vector
+        support = cv2.warpAffine(seed, translation, fill.shape[::-1], flags=cv2.INTER_NEAREST) > 0
+        support &= candidates & ~approved
+        if np.count_nonzero(support) < 64:
+            continue
+        for region in component_regions(support):
+            if region.pixels < 64:
+                continue
+            local = translation.copy()
+            local[:, 2] -= [region.x, region.y]
+            observed = cv2.warpAffine(gray, local, region.mask.shape[::-1])
+            target = gray[region.slices]
+            visible = ~occluded[region.slices]
+
+            def check(y, x, mask):
+                slices = np.s_[y:y+mask.shape[0], x:x+mask.shape[1]]
+                evidence = mask & visible[slices]
+                if evidence.sum() < max(64, .5 * mask.sum()):
+                    return False
+                ncc = _ncc(observed[slices][evidence].astype(np.float32),
+                           target[slices][evidence].astype(np.float32))
+                if ncc < min_ncc:
+                    return False
+                metrics = verify(MaskRegion(region.y+y, region.x+x, evidence), ncc, step)
+                if metrics is None:
+                    return False
+                out = approved[region.slices]
+                out[slices] |= mask
+                records.append(dict(step=step, target_bbox=[region.x+x, region.y+y,
+                    region.x+x+mask.shape[1], region.y+y+mask.shape[0]],
+                    pixels=int(mask.sum()), metrics=metrics))
+                return True
+
+            if check(0, 0, region.mask) or max(region.mask.shape) <= tile_size:
+                continue
+            for y in range(0, region.mask.shape[0], tile_size):
+                for x in range(0, region.mask.shape[1], tile_size):
+                    check(y, x, region.mask[y:y+tile_size, x:x+tile_size])
     return approved, records

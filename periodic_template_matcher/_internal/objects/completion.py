@@ -17,7 +17,8 @@ from ..segmentation.regions import MaskRegion, RegionResize, component_regions
 from ..registration.core import _features
 from ..registration.scoring import ScoreWarp, _ncc, _score, _ecc_translation
 from .axes import transpose_image, transpose_config, transpose_prediction
-from .support_anchors import canonical_support_objects, interior_bridges
+from .support_anchors import (canonical_support_objects, corroborate_clipped_bridges,
+                              interior_bridges, verified_repeat_regions)
 
 
 def _white_occlusions(gray, valid):
@@ -72,7 +73,8 @@ def complete_object_support(prediction, images, references, source_valids,
     vectors = support_vectors(target_vectors, cfg, source_vectors=sources)
     info = dict(added_valid_pixels=0, added_foreground_pixels=0, copies=[],
                 repeat_axes=list(cfg.periodic_axes(cfg.ordered_object_class)),
-                bridged_foreground_pixels=0)
+                bridged_foreground_pixels=0, verified_repeat_foreground_pixels=0,
+                clipped_bridge_pixels=0, clipped_bridges=[])
     prediction.diagnostics['support_completion'] = info
     if not vectors or prediction.valid[target_valid > 0].all():
         return
@@ -102,6 +104,7 @@ def complete_object_support(prediction, images, references, source_valids,
     confirmed = None
     projections = {}
     attempted = set()
+    repeat_warps = {}
 
     def support_objects():
         # First use the existing cheap/verified copies. Most images become
@@ -143,7 +146,13 @@ def complete_object_support(prediction, images, references, source_valids,
                 # them too, BEFORE any bridge can contribute anchor evidence.
                 confirmed = replace(prediction, identities=prediction.identities.copy(),
                                     valid=prediction.valid.copy())
-            steps = [0] if anchor else [s for n in range(1, cfg.periodic_max_steps+1) for s in (n, -n)]
+            if anchor:
+                steps = [0, -1, 1] if cfg.periodic_max_steps else [0]
+            else:
+                steps = [s for n in range(1, cfg.periodic_max_steps+1) for s in (n, -n)]
+            bridge_only = bool(anchor and anchor.get('bridge_only'))
+            clipped = []
+            bridged = None
             for step in steps:
                 shift = np.eye(3)
                 shift[:2, 2] = step*vector
@@ -153,18 +162,24 @@ def complete_object_support(prediction, images, references, source_valids,
                 xs = np.flatnonzero(own.any(axis=0))
                 if not len(xs):
                     continue
-                band = np.zeros(shape, bool)
-                band[:, xs.min():xs.max()+1] = True
-                annotation = warp_valid_mask(source_valids[ti], candidate, target.shape) & band
+                band = np.s_[:, xs[0]:xs[-1]+1]
+                local_candidate = candidate.copy()
+                local_candidate[0] -= xs[0] * candidate[2]
+                annotation = warp_valid_mask(source_valids[ti], local_candidate, mapped[band].shape)
                 # Extra canonical coverage addresses the observed object, not
                 # surrounding background. Keep unverified background unknown
                 # and avoid rescoring large irrelevant background rectangles.
                 if anchor or not ref.get('background_known', True):
-                    annotation &= mapped > 0
-                if not (annotation & target_roi & ~prediction.valid).any():
+                    annotation &= mapped[band] > 0
+                missing = (prediction.labels[band] == 0 if bridge_only else ~prediction.valid[band])
+                missing &= annotation & target_roi[band]
+                if not missing.any() or (anchor and step and np.count_nonzero(missing) < 64):
                     continue
-                fill = _candidate_fill(mapped, annotation, target_valid, prediction.labels, prediction.valid)
-                fill &= (prediction.labels == 0)
+                fill = np.zeros(shape, bool)
+                if not (bridge_only or (anchor and step)):
+                    fill[band] = _candidate_fill(mapped[band], annotation, target_valid[band],
+                                                 prediction.labels[band], prediction.valid[band])
+                    fill[band] &= prediction.labels[band] == 0
                 key = ti, ri, tuple(np.round(candidate.ravel(), 6))
                 if key in projections:
                     observed_source, work, work_source, work_support, score_warp = projections[key]
@@ -183,6 +198,7 @@ def complete_object_support(prediction, images, references, source_valids,
                               matrix_template_to_target=candidate.tolist(), regions=[])
                 approved = np.zeros(shape, bool)
                 approved_labels = np.zeros(shape, np.uint16)
+                repeat_fill = None
                 if anchor:
                     def verify_end(mask, pixel_ncc):
                         if pixel_ncc < cfg.periodic_min_ncc:
@@ -198,21 +214,35 @@ def complete_object_support(prediction, images, references, source_valids,
                             return None
                         return dict(metrics, region_ncc=pixel_ncc)
 
+                    # Retry one verified phase in either direction: moving the
+                    # source window can expose a real anchor beyond a defect.
+                    height = max(16, round((12 if step else 32)/scale))
                     bridge, ends = interior_bridges(mapped, confirmed, identity, observed_source,
                         target_gray, occluded, np.linalg.norm(vector)*cfg.periodic_max_steps,
-                        max(16, round(32/scale)), verify_end)
-                    bridge &= target_roi & ~prediction.valid & (prediction.labels == 0)
+                        height, verify_end, phase_retry=bool(step),
+                        include_background=bridge_only, clipped_candidates=clipped, columns=band[1])
+                    bridge &= target_roi & (prediction.labels == 0)
+                    if not bridge_only:
+                        bridge &= ~prediction.valid
+                    pixels = int(bridge.sum())
+                    if pixels:
+                        if bridged is None:
+                            bridged = bridge
+                        else:
+                            bridged |= bridge
                     approved |= bridge
                     approved_labels[bridge] = mapped[bridge]
                     fill &= ~bridge
                     record.update(canonical_anchor=anchor, interior_bridges=ends)
-                    info['bridged_foreground_pixels'] += int(bridge.sum())
+                    info['bridged_foreground_pixels'] += pixels
+                    if not bridge_only and not step and cfg.periodic_max_steps:
+                        repeat_fill = fill & ~prediction.valid
                 # Canonical rephasing may select an already tried pose. Its
                 # bridge checks are new, but direct scoring/ECC need not repeat.
-                if key in attempted:
+                if (anchor and step) or key in attempted:
                     fill[:] = False
                 attempted.add(key)
-                regions = list(component_regions(fill))
+                regions = [region for region in component_regions(fill) if region.pixels >= 64]
                 pending = [(region, False) for region in regions]
                 tile_size = max(16, round(32/scale))
                 group_key = (obj['identity'], ti, ri, tuple(vector))
@@ -288,9 +318,12 @@ def complete_object_support(prediction, images, references, source_valids,
                                 if support[slices][region.mask].all():
                                     values = observed[slices][evidence].astype(np.float32)
                                     refined_ncc = _ncc(values, b) if np.std(values) >= 2 else 0.
-                                    refined_metrics = _score(src, (dst[0], dst[1], dst[2], local),
-                                        refined_work, local_cfg, warped=refined_warp)
-                                    if (refined_ncc >= cfg.periodic_min_ncc
+                                    if refined_ncc >= cfg.periodic_min_ncc:
+                                        refined_metrics = _score(src, (*dst[:3], local), refined_work,
+                                                                 local_cfg, warped=refined_warp)
+                                    else:
+                                        refined_metrics = None
+                                    if (refined_metrics is not None
                                             and refined_metrics['structure_ncc'] >= cfg.periodic_min_ncc
                                             and refined_metrics['edge_alignment'] >= cfg.periodic_min_edge):
                                         # Paste the mask using the transform that
@@ -324,9 +357,34 @@ def complete_object_support(prediction, images, references, source_valids,
                             for y in range(int(yy.min()), int(yy.max())+1, tile_size):
                                 for x in range(int(xx.min()), int(xx.max())+1, tile_size):
                                     piece = region.mask[y:y+tile_size, x:x+tile_size]
-                                    if not piece.any():
+                                    if piece.sum() < 64:
                                         continue
                                     pending.append((MaskRegion(region.y+y, region.x+x, piece), True))
+                if repeat_fill is not None:
+                    # Give verified template support first choice. Splitting a
+                    # known region before scoring can lose its original evidence.
+                    repeat_fill &= ~approved
+                    if np.count_nonzero(repeat_fill) >= 64:
+                        def verify_repeat(region, pixel_ncc, direction):
+                            cache_key = tuple(direction * vector)
+                            if cache_key not in repeat_warps:
+                                transform = np.eye(3)
+                                transform[:2, 2] = Db[:2, :2] @ (direction * vector)
+                                repeat_warps[cache_key] = ScoreWarp(dst, transform, ts)
+                            warped = repeat_warps[cache_key]
+                            local = cv2.dilate(resize_region(region), np.ones((25, 25), np.uint8)) & dst[3]
+                            metrics = _score(dst, (*dst[:3], local), warped.H, local_cfg, warped=warped)
+                            if (metrics['structure_ncc'] < cfg.periodic_min_ncc
+                                    or metrics['edge_alignment'] < cfg.periodic_min_edge):
+                                return None
+                            return dict(metrics, region_ncc=pixel_ncc)
+
+                        repeat, repeats = verified_repeat_regions(repeat_fill, mapped, confirmed, identity,
+                            target_gray, occluded, vector, tile_size, cfg.periodic_min_ncc, verify_repeat)
+                        approved |= repeat
+                        approved_labels[repeat] = mapped[repeat]
+                        record['verified_repeats'] = repeats
+                        info['verified_repeat_foreground_pixels'] += int(repeat.sum())
                 record['accepted'] = bool(approved.any())
                 info['copies'].append(record)
                 if not approved.any():
@@ -338,5 +396,22 @@ def complete_object_support(prediction, images, references, source_valids,
                 prediction.identities[positive] = identity
                 prediction.valid |= approved
                 obj.setdefault('supporting_transforms', []).append(candidate.tolist())
+            if clipped and bridged is not None:
+                for region, direction, endpoint in corroborate_clipped_bridges(
+                        clipped, bridged, confirmed, identity, vector, max(1, round(1/scale))):
+                    slices = region.slices
+                    fill = region.mask & target_roi[slices] & (prediction.labels[slices] == 0)
+                    pixels = int(fill.sum())
+                    if not pixels:
+                        continue
+                    info['clipped_bridge_pixels'] += pixels
+                    info['added_valid_pixels'] += int((fill & ~prediction.valid[slices]).sum())
+                    info['added_foreground_pixels'] += pixels
+                    info['clipped_bridges'].append(dict(identity=obj['identity'], step=direction,
+                        target_bbox=[region.x, region.y, slices[1].stop, slices[0].stop],
+                        pixels=pixels, anchor=endpoint))
+                    prediction.labels[slices][fill] = cfg.ordered_object_class
+                    prediction.identities[slices][fill] = identity
+                    prediction.valid[slices] |= fill
     prediction.diagnostics['valid_coverage_roi'] = float(
         (prediction.valid & (target_valid > 0)).sum()/max(int((target_valid > 0).sum()), 1))

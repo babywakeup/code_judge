@@ -60,7 +60,7 @@ def _edge_distances(source_edges: Array, target_edges: Array) -> Array:
 
 
 def _score(src: Features, dst: Features, H: Matrix, cfg: MatcherConfig, *,
-           warped: ScoreWarp | None = None) -> Diagnostics:
+           warped: ScoreWarp | None = None, min_structure_ncc: float | None = None) -> Diagnostics:
     tn, _, te, tm = dst
     size = (tn.shape[1], tn.shape[0])
     warped = warped if warped is not None else ScoreWarp(src, H, size)
@@ -73,6 +73,10 @@ def _score(src: Features, dst: Features, H: Matrix, cfg: MatcherConfig, *,
         return empty
     wn = warped.intensity
     ncc = _ncc(wn[valid], tn[valid])
+    if min_structure_ncc is not None and ncc < min_structure_ncc:
+        # Local acceptance requires both gates. An NCC failure cannot be
+        # rescued by the more expensive symmetric edge-distance calculation.
+        return dict(empty, structure_ncc=ncc, edge_evaluated=False)
     we = (warped.edges > 0) & valid
     et = (te > 0) & valid
     if we.sum() < 40 or et.sum() < 40:

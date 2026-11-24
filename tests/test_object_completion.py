@@ -126,3 +126,43 @@ class ObjectCompletionTests(unittest.TestCase):
         self.assertTrue(prediction.valid[40:260, 26:54].all())
         np.testing.assert_array_equal(prediction.labels[40:260, 26:54], np.roll(truth, 3, axis=1)[40:260, 26:54])
 
+    def test_bridge_follows_a_curved_component_to_both_anchors(self):
+        from periodic_template_matcher._internal.objects.support_anchors import interior_bridges
+
+        mapped = np.zeros((120, 100), np.uint16)
+        mapped[15:36, 40:65] = 2
+        mapped[35:84, 32:42] = 2
+        mapped[84:106, 40:65] = 2
+        # Both visible ends bend out of the gap's horizontal span.
+        known = mapped > 0
+        known[36:84] = False
+        prediction = ObjectPrediction(np.where(known, mapped, 0),
+                                      known.astype(np.uint16), known, {})
+        rng = np.random.default_rng(34)
+        gray = rng.integers(10, 240, mapped.shape, dtype=np.uint8)
+        approved, records = interior_bridges(mapped, prediction, 1, gray, gray,
+            np.zeros_like(known), 90, 12, lambda region, ncc: {'ncc': ncc} if ncc > .99 else None)
+        np.testing.assert_array_equal(approved, (mapped > 0) & ~known)
+        self.assertEqual(len(records), 1)
+
+    def test_same_identity_repeat_fills_only_matching_unknown_contour(self):
+        from periodic_template_matcher._internal.objects.support_anchors import verified_repeat_regions
+
+        rng = np.random.default_rng(23)
+        texture = rng.integers(20, 220, (64, 112), dtype=np.uint8)
+        gray = np.tile(texture, (2, 1))
+        gray[88:108, 45:65] = np.flipud(gray[88:108, 45:65])
+        ids = np.zeros(gray.shape, np.uint16)
+        mapped = np.zeros_like(ids)
+        for x, identity in [(10, 1), (45, 1), (80, 2)]:
+            ids[24:44, x:x+20] = identity
+            mapped[88:108, x:x+20] = 2
+        known = ids > 0
+        prediction = ObjectPrediction(known.astype(np.uint16)*2, ids, known, {})
+        approved, records = verified_repeat_regions(mapped > 0, mapped, prediction, 1, gray,
+            np.zeros_like(known), np.array([0., 64.]), 32, .8,
+            lambda region, ncc, step: dict(ncc=ncc))
+        expected = np.zeros_like(approved)
+        expected[88:108, 10:30] = True
+        np.testing.assert_array_equal(approved, expected)
+        self.assertEqual(len(records), 1)

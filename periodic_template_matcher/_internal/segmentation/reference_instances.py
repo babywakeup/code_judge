@@ -13,26 +13,40 @@ from .regions import MaskRegion, RegionResize
 
 
 def complete_reference_instances(result, target_valid, cfg, *, labels,
-                                 annotation_valid, source_valid, template_index):
-    """Use only the selected source's complete, explicitly known foreground.
+                                 annotation_valid, source_valid, template_index,
+                                 source_image=None):
+    """Use a geometrically accepted source's complete, explicitly known foreground.
 
     An observed target contour may be two periods away while an independently
-    annotated source contour is within one configured step of the global pose.
-    Never extend the step budget or use a newly invented intermediate contour.
+    annotated source contour is within one configured step of a registered pose.
+    An alternate registration can also provide a missing contour at its direct pose.
     """
     if not (cfg.periodic_completion and cfg.shared_periods and cfg.label_mode == 'semantic'):
         return
     info = result.registration.get('periodic_completion', {})
     lattice = info.get('lattice', [])
-    H = result.matrix_template_to_target
-    if not lattice or H is None or result.mapped_labels is None or result.label_valid is None:
+    if result.mapped_labels is None or result.label_valid is None:
         return
-    if template_index != result.registration['ranking'][0]:
-        raise ValueError('Reference contours must belong to the selected lattice template')
-    shape = result.template_image.shape[:2]
-    if any(array.shape != shape for array in (labels, annotation_valid, source_valid)):
-        raise ValueError('Reference labels and validity must match the selected template shape')
+    alternate = template_index != result.registration['ranking'][0]
+    if alternate:
+        if source_image is None or template_index not in result.registration['ranking']:
+            raise ValueError('Alternate reference contours require their ranked source image')
+        candidate = result.registration['matches'][template_index]
+        matrix = candidate.get('matrix_template_to_target')
+        if not candidate.get('geometry_accepted') or matrix is None:
+            return
+        H = np.asarray(matrix, float)
+    else:
+        H, source_image = result.matrix_template_to_target, result.template_image
+        if not lattice or H is None:
+            return
+    shape = source_image.shape[:2]
+    if labels.shape != shape or source_valid.shape != shape or (
+            annotation_valid is not None and annotation_valid.shape != shape):
+        raise ValueError('Reference labels and validity must match their source image')
     offsets = []
+    if alternate:
+        offsets.append(((0,) * len(lattice), [], np.zeros(2), H))
     for offset in product(range(-cfg.periodic_max_steps, cfg.periodic_max_steps+1), repeat=len(lattice)):
         active = [axis for n, axis in zip(offset, lattice) if n]
         if not active or not all(axis.get('verified', False) for axis in active):
@@ -46,16 +60,22 @@ def complete_reference_instances(result, target_valid, cfg, *, labels,
             offsets.append((offset, vectors, shift, C))
     if not offsets:
         return
-    source_known = (annotation_valid > 0) & (source_valid > 0)
+    source_known = source_valid > 0
+    if annotation_valid is not None:
+        source_known &= annotation_valid > 0
     known = result.label_valid & (target_valid > 0)
     occupied = result.mapped_labels > 0
     classes = [int(c) for c in np.unique(labels[source_known])
                if c > 0 and c != cfg.ordered_object_class and cfg.periodic_axes(int(c))]
     records = dict(copies=[], appearance_candidates=0, added_label_pixels=0)
-    info['reference_instances'] = records
+    if alternate:
+        records['template_index'] = template_index
+        info.setdefault('alternate_reference_instances', []).append(records)
+    else:
+        info['reference_instances'] = records
     h, w = occupied.shape
     sh, sw = labels.shape
-    scale = cfg.matching_scale(result.template_image.shape, result.input_image.shape)
+    scale = cfg.matching_scale(source_image.shape, result.input_image.shape)
     ss = (round(sw*scale), round(sh*scale))
     ts = (round(w*scale), round(h*scale))
     Da, Db = np.diag([ss[0]/sw, ss[1]/sh, 1.]), np.diag([ts[0]/w, ts[1]/h, 1.])
@@ -97,7 +117,7 @@ def complete_reference_instances(result, target_valid, cfg, *, labels,
                 if not mapped.any() or (dest_halo & (~known[dest_slice] | occupied[dest_slice])).any():
                     continue
                 if source_gray is None:
-                    source_gray, target_gray = to_gray(result.template_image), to_gray(result.input_image)
+                    source_gray, target_gray = to_gray(source_image), to_gray(result.input_image)
                 observed = cv2.warpPerspective(source_gray[source_slice], local, size,
                                                flags=cv2.INTER_NEAREST)
                 raw = _ncc(observed[mapped].astype(np.float32),
