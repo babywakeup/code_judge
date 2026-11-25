@@ -33,8 +33,9 @@ def _correlation_peaks(patch: Array, mask: Mask, target: Array, valid: Mask,
     score = numerator/np.sqrt(np.maximum(energy, 1e-8))
     # FFT/convolution roundoff can give almost-flat intersections a spurious NCC
     # of 1. Require actual contrast in BOTH observed patches before normalization.
-    eligible = ((count >= max(64, cfg.object_min_visible*float(mask.sum())))
-                & (target_energy/denominator > .0025) & (source_energy/denominator > .0025))
+    eligible = ((count >= max(cfg.object_min_work_pixels, cfg.object_min_visible*float(mask.sum())))
+                & (target_energy/denominator > cfg.object_min_variance)
+                & (source_energy/denominator > cfg.object_min_variance))
     score = np.where(eligible & np.isfinite(score), np.clip(score, -1, 1), -1)
     peaks = []
     partial_cycle = cfg.object_visible_count is not None

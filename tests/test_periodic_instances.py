@@ -15,7 +15,7 @@ from periodic_template_matcher import MatcherConfig, PeriodicTemplateMatcher
 from periodic_template_matcher._internal.models import MatchResult
 from periodic_template_matcher._internal.objects.axes import transpose_config, transpose_diagnostics
 from periodic_template_matcher._internal.segmentation.crop import rebase_diagnostics
-from periodic_template_matcher._internal.segmentation.instances import complete_periodic_instances
+from periodic_template_matcher._internal.segmentation.instances import _complete_observed_instances as complete_periodic_instances
 
 
 class PeriodicInstanceTests(unittest.TestCase):
@@ -66,6 +66,54 @@ class PeriodicInstanceTests(unittest.TestCase):
         self.run_fill(data)
         self.assertFalse(data[0].mapped_labels[20:44, 180:204].any())
         self.assertFalse(data[0].mapped_labels[180:204, 20:44].any())
+
+    def test_unresolved_objects_do_not_disable_independent_semantic_periods(self):
+        data = self.fixture()
+        result = data[0]
+        result.object_valid[:] = False
+        result.label_valid[:] = result.mapped_labels > 0
+        self.run_fill(data)
+        np.testing.assert_array_equal(result.mapped_labels[100:124, 100:124], 1)
+        self.assertTrue(result.label_valid[100:124, 100:124].all())
+        self.assertTrue(result.label_periodic_valid[100:124, 100:124].all())
+        self.assertFalse(result.label_valid[result.mapped_labels == 0].any())
+        self.assertFalse(result.object_valid.any())
+        self.assertFalse(result.object_identities.any())
+
+    def test_verified_target_period_can_finish_a_contour_cut_by_direct_footprint(self):
+        data = self.fixture()
+        result = data[0]
+        result.mapped_labels[100:120, 20:44] = 1
+        result.geometric_valid[120:] = False
+        result.label_valid[120:] = False
+        result.direct_labels = result.mapped_labels.copy()
+        result.direct_valid = result.geometric_valid.copy()
+        result.registration['periodic_completion']['lattice'][1]['target_verification'] = {'verified': True}
+        with_annotation_hole = deepcopy(result)
+        with_annotation_hole.geometric_valid[120, 25] = True
+        self.run_fill((with_annotation_hole, *data[1:]))
+        self.assertFalse(with_annotation_hole.label_valid[120, 25])
+        self.run_fill(data)
+        np.testing.assert_array_equal(result.mapped_labels[100:124, 20:44], 1)
+        self.assertTrue(result.label_periodic_valid[120:124, 20:44].all())
+        self.assertFalse(result.label_periodic_valid[100:120, 20:44].any())
+        self.assertFalse(result.label_valid[124:].any())
+        self.assertFalse(result.label_valid[120:124, :20].any())
+
+    def test_tnxxx0_77_recovers_periodic_foreground_below_the_direct_footprint(self):
+        root = Path(__file__).resolve().parents[1]
+        image = root/'source/SD-1/imgs/TNXXX0/18851_AFE55CN029A_TDAOI810_77_225.545_79.559_O_M_20260119_085609.jpg'
+        if not image.is_file():
+            self.skipTest('Local SD-1 photograph is not installed')
+        result = PeriodicTemplateMatcher(root/'periodic_template_matcher/config.sd1.labelme.opencv.json').infer(image)
+        for x, y in ((381, 1804), (1164, 1801), (2041, 1801)):
+            with self.subTest(x=x, y=y):
+                self.assertFalse(result.geometric_valid[y, x])
+                self.assertEqual(result.direct_labels[y, x], 0)
+                self.assertEqual(result.completion_labels[y, x], 1)
+                self.assertEqual(result.mapped_labels[y, x], 1)
+        self.assertEqual(result.registration['ordered_objects']['visible_order'], 'ABC')
+        self.assertFalse(result.completion_labels[1891:].any())
 
     def test_nonshared_disabled_and_nonsemantic_modes_keep_old_policy(self):
         for options in (dict(shared_periods=False), dict(periodic_completion=False),
@@ -225,9 +273,12 @@ class PeriodicInstanceTests(unittest.TestCase):
             snapshot = Path(folder)/'config.json'
             snapshot.write_text(json.dumps(spec), encoding='utf-8')
             matcher = PeriodicTemplateMatcher(snapshot)
-            with patch('periodic_template_matcher._internal.pipeline.complete_periodic_instances'):
-                before = matcher.infer()
-            after = matcher.infer()
+            # Isolate the target-to-target fallback. Directly supported
+            # contours take precedence when the normal pipeline can find them.
+            with patch('periodic_template_matcher._internal.pipeline.complete_direct_references'):
+                with patch('periodic_template_matcher._internal.pipeline.complete_periodic_instances'):
+                    before = matcher.infer()
+                after = matcher.infer()
         self.assertTrue(after.accepted)
         self.assertEqual(after.registration['ordered_objects']['visible_order'], 'CDA')
         for field in ('matrix_template_to_target', 'object_identities', 'object_valid',

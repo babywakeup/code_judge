@@ -204,9 +204,13 @@ class ReferenceInstanceTests(unittest.TestCase):
             snapshot = Path(folder)/'config.json'
             snapshot.write_text(json.dumps(spec), encoding='utf-8')
             matcher = PeriodicTemplateMatcher(snapshot)
-            with patch('periodic_template_matcher._internal.segmentation.instances.complete_reference_instances'):
-                before = matcher.infer()
-            after = matcher.infer()
+            # Verify the reference fallback without competing direct or
+            # target-to-target contour transfers.
+            with (patch('periodic_template_matcher._internal.pipeline.complete_direct_references'),
+                  patch('periodic_template_matcher._internal.segmentation.instances._complete_observed_instances')):
+                with patch('periodic_template_matcher._internal.segmentation.instances.complete_reference_instances'):
+                    before = matcher.infer()
+                after = matcher.infer()
         self.assertTrue(after.accepted)
         self.assertEqual(after.registration['ordered_objects']['visible_order'], 'ABC')
         for field in ('matrix_template_to_target', 'object_identities', 'object_valid',
@@ -215,13 +219,15 @@ class ReferenceInstanceTests(unittest.TestCase):
         old = before.mapped_labels > 0
         np.testing.assert_array_equal(after.mapped_labels[old], before.mapped_labels[old])
         copies = after.registration['periodic_completion']['reference_instances']['copies']
-        self.assertEqual(len(copies), 2)
+        circled = []
         for x, y in ((2255, 490), (2255, 1370)):
             self.assertEqual(before.mapped_labels[y, x], 0)
             self.assertEqual(after.mapped_labels[y, x], 1)
-            self.assertTrue(any(x0 <= x < x1 and y0 <= y < y1
-                for x0, y0, x1, y1 in (copy['target_bbox'] for copy in copies)))
-        self.assertEqual(sum(copy['added_label_pixels'] for copy in copies), 16176)
+            covering = [copy for copy in copies if copy['target_bbox'][0] <= x < copy['target_bbox'][2]
+                        and copy['target_bbox'][1] <= y < copy['target_bbox'][3]]
+            self.assertEqual(len(covering), 1)
+            circled.extend(covering)
+        self.assertEqual(sum(copy['added_label_pixels'] for copy in circled), 16176)
         self.assertTrue(all(copy['raw_pixel_ncc'] >= matcher.config.periodic_min_ncc for copy in copies))
         self.assertTrue(all(max(abs(n) for n in copy['offset']) <= 1 for copy in copies))
 

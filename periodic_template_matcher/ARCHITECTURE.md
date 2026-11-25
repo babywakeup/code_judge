@@ -42,10 +42,16 @@
 | [objects/matching.py](_internal/objects/matching.py) | 组织对象候选生成、布局选择和预测输出 |
 | [objects/appearance.py](_internal/objects/appearance.py) | 在真实可见交集上搜索对象外观相关峰 |
 | [objects/layout.py](_internal/objects/layout.py) | 候选质量、参考间距估计、循环身份顺序求解 |
-| [segmentation/instances.py](_internal/segmentation/instances.py) | 融合后独立验收已知背景中的周期语义小实例；保护全部既有前景 |
+| [segmentation/instances.py](_internal/segmentation/instances.py) | 融合前独立验收已知语义背景中的周期小实例，保护语义分支已有前景 |
+| [segmentation/occlusion.py](_internal/segmentation/occlusion.py) | 常规补全后，从已验证的同相位周期恢复缺陷遮挡的前景 |
 
 `core` 与 `matching` 保留原有辅助函数的导入入口；函数实现只存在于对应职责模块中。
 周期分割与对象补全直接复用 `scoring`，不通过配准搜索流程访问评分算法。
+
+`step3.robust_appearance` 在 SD-1 OpenCV 配置中开启。基础配准未达标时，使用低频特征重新评分已有候选；
+有基础配准但对象证据不足时，仍按配置中的分数和身份顺序规则重新搜索对象。遮挡补全需要已验证的目标周期、
+同相位可见纹理，以及目标的纹理损失或连续暗遮挡。较大的邻域提供位置证据，语义前景取自原始模板标注。
+语义轮廓从待补区跨入直接背景时须属于同一连通分量，对象延伸须与同一身份的已有轮廓连通。
 `Features` 表示归一化亮度、梯度、边缘和有效区域四元组；对象候选中的
 `_mask`、`_support` 等字段包含内部数组，不属于可序列化的诊断输出。
 
@@ -73,19 +79,21 @@ flowchart TD
     Accepted -- 否 --> Return
     Accepted -- 是 --> Transfer[4 LabelTransferStep]
     Transfer --> Periodic[5 PeriodicCompletionStep]
-    Periodic --> Located{启用了独立实例分支?}
-    Located -- 否 --> Interior[8 Verified periodic semantic instances]
+    Periodic --> Direct[补充直接模板轮廓]
+    Direct --> Interior[验收周期语义轮廓并保存图层]
+    Interior --> Located{启用了独立实例分支?}
+    Located -- 否 --> Return
     Located -- 是 --> Support[6 ObjectSupportCompletionStep]
     Support --> Fusion[7 PredictionFusionStep]
-    Fusion --> Interior
-    Interior --> Return
+    Fusion --> Return
 ```
 
 注意：步骤 3 必须在“匹配是否接受”的最终判断之前执行。只有模板分数接近
 （`templates_too_close`）时，强实例证据才可能解除模板选择歧义；它不能把普通低分匹配改成接受。
-步骤 6 必须在步骤 5 后面，因为它依赖基础周期分支验证过的几何关系。
-最后的可选语义轮廓补全仅在共享且已验证晶格下执行，必须位于融合后：冻结最终已有轮廓
-作为来源，拒绝与任何已有前景重叠的目标，避免重新引入 base 错相位或覆盖已确认身份。
+步骤 6 在步骤 5 后执行，复用基础周期分支验证的几何。全图语义复制未通过时，已确认的对象可沿目标图独立验证的周期提出补全，实际像素仍须通过对象分支的局部验证。
+可选语义轮廓补全在最终融合前执行，冻结当前语义轮廓作为来源，并验证目标的周期证据。
+完整的直接匹配轮廓可沿目标图已验证的周期延伸到主模板投影外。已有覆盖部分须与轮廓一致，只补通过局部验证的前景。
+直接匹配、周期补全和独立对象各自保存已验证的图层。重叠像素的最终类别由融合优先级决定。
 该小型算法直接以具名函数调用，不增加只有转发作用的 Step 包装类。
 
 ## 3. 每个功能所属的类
@@ -95,11 +103,11 @@ flowchart TD
 | 1 `InputPreparationStep` | 数组与数量校验、标签归一化、有效高度与图像 ROI、实例参考校验及 `background_known` | 提取特征、配准、读文件 | [preparation.py](_internal/segmentation/preparation.py)；复用 `ValidRegion` |
 | 2 `RegistrationStep` | 模板选择、记录配置/ROI、创建结果、直接图像和几何有效范围投影 | 标签迁移、实例融合 | [步骤实现](_internal/registration/step.py) → [配准算法](_internal/registration/core.py) 的 `select_templates()` |
 | 3 `OrderedObjectStep` | 组织各模板实际已知参考、独立身份定位、仅在模板接近时使用实例证据消歧 | 全局晶格复制实例、支持补全 | [steps.py](_internal/objects/steps.py) → [matching.py](_internal/objects/matching.py) 的 `match_ordered_objects()` |
-| 4 `LabelTransferStep` | 结合图像 ROI 与标注有效范围，用直接变换迁移标签；从基础分支移除独立实例类别 | 推断周期、定位实例 | [transfer.py](_internal/segmentation/transfer.py) → [masks.py](utils/masks.py) 的 `warp_labels()` |
-| 5 `PeriodicCompletionStep` | 控制仅在启用且为 semantic 时进行基础周期补全 | 身份支持补全、最终结果融合 | [步骤实现](_internal/segmentation/transfer.py) → [periodic.py](_internal/segmentation/periodic.py) 的 `complete_periodic()` |
+| 4 `LabelTransferStep` | 在图像和标注都有效的位置迁移主模板标签，再用局部验证过的其他配准模板覆盖缺口。独立实例类别单独定位 | 直接图层与已知范围 | [transfer.py](_internal/segmentation/transfer.py) |
+| 5 `PeriodicCompletionStep` | 用直接迁移后的剩余缺口驱动周期补全。其他模板沿已验证周期只验证候选轮廓 | 周期图层与身份支持所需的几何 | [periodic.py](_internal/segmentation/periodic.py) |
 | 6 `ObjectSupportCompletionStep` | 筛选已批准的晶格几何，把源周期向量换算到目标原图坐标，补全已定位身份的支持 | 无证据生成身份、沿排列轴复制实例 | [步骤实现](_internal/objects/steps.py) → [completion.py](_internal/objects/completion.py) 的 `complete_object_support()` |
 | 7 `PredictionFusionStep` | 保存基础预测快照、保护基础前景、融合实例及身份图、协调未知区域与最终覆盖统计 | 再次匹配、修改阈值 | [fusion.py](_internal/objects/fusion.py) |
-| 8 `complete_periodic_instances()` | 冻结完整非身份轮廓，以同图周期对应区的独立像素及结构/边缘证据补已知空背景 | 覆盖已有前景、传播身份、认证未知、修改健康模板、增添 ECC 或自举 | [instances.py](_internal/segmentation/instances.py) |
+| `complete_periodic_instances()` | 冻结完整非身份轮廓，依据目标图周期、像素、结构和边缘证据补全语义前景 | 覆盖已有语义前景、传播身份、认证未知背景、修改健康模板、增添 ECC 或自举 | [instances.py](_internal/segmentation/instances.py) |
 | 可选 `SegmentationEvaluationStep` | 校验 GT 与评价 ROI，对最终结果计算指标，处理拒绝/无标注情况 | 用 GT 指导任何推理步骤 | [evaluation.py](_internal/segmentation/evaluation.py)，同模块定义 `evaluate_segmentation()` |
 | `MatchPipeline` | 控制顺序、分支和提前返回；持有每个 Step | IO、数值匹配、评价 | [pipeline.py](_internal/pipeline.py) |
 
@@ -151,6 +159,7 @@ flowchart TD
 
 1. **图像 ROI ≠ 标注知识**：图像 ROI 用于外观证据；标注有效范围表示标签已知与否，
    未知不能变成背景。高度在输入准备阶段解析，配准阶段清除高度/底部比例策略，避免再次裁行。
+   启用周期补全时，其他模板提供的背景先记为候选，在前景补全结束后确认剩余背景。
 2. **所有 Step 接口使用原图坐标**：矩阵为模板原图 → 目标原图，周期向量来自源原图；
    支持补全通过矩阵的线性部分换算向量，不能加上平移量。算法内部自行处理工作分辨率/转置。
 3. **几何批准 ≠ 标签副本接受**：`geometry_accepted` 与 `accepted` 不能混用。
@@ -160,11 +169,12 @@ flowchart TD
    防止基础周期错相位切掉实例分叉。原基础标签保留在快照中，冲突与覆盖计数分别为
    `foreground_conflict_pixels`、`instance_priority_pixels`。未知身份不覆盖基础前景。
   最终单通道优先级不影响独立来源：`direct_labels/direct_valid` 在移除独立匹配的 ordered 类之后保存，
-  `completion_labels/completion_valid` 在融合前保存并追加后续已验收补全，
+  `completion_labels/completion_valid` 保存周期候选验收后的原始前景轮廓，允许和直接层重叠。
+  `label_periodic_valid` 跟踪周期阶段实际写入融合结果的像素。
   `object_labels/object_layer_valid/object_layer_identities` 保留未被优先级裁剪的对象证据。
   来源之间允许重叠，查看器不能用最终互斥标签反推这些层；GT 评价仍针对原最终预测。
-6. **基础快照包含基础周期补全**：`base_labels` / `base_valid` 是实例融合前的基础输出，
-  不是仅直接配准的结果，也不包含融合后的独立语义轮廓补全。
+6. **基础快照包含基础周期补全**：`base_labels` / `base_valid` 在基础周期补全与直接轮廓补充之后保存，
+  独立语义轮廓补全另存于周期图层。
   `warped_template` / `geometric_valid` 才描述直接几何。
 7. **评价与推理解耦**：GT 只进入 `SegmentationEvaluationStep`，不会进入配准或补全。
 

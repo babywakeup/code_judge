@@ -78,7 +78,7 @@ def calibrate_lattice(src, dst, vectors, matrix, source_to_work, target_to_work,
     mandatory, including after object aliases propose a refined displacement.
     The context is serializable and is reused without re-estimating each copy.
     """
-    local_cfg = replace(cfg, min_overlap=.2)
+    local_cfg = replace(cfg, min_overlap=cfg.local_min_overlap)
     source_levels = prepare_refinement_target(src)
     target_levels = prepare_refinement_target(dst)
     records = []

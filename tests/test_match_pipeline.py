@@ -106,6 +106,30 @@ class MatchStepTests(unittest.TestCase):
         step.run(self.inputs, match, located, self.config)
         self.assertEqual(complete.call_count, 1)
 
+    def test_aligned_objects_can_use_verified_y_period_without_a_semantic_copy(self):
+        self.config.ordered_object_class = 2
+        self.config.class_periodicity = {'2': ['y']}
+        self.config.shared_periods = True
+        axes = [
+            dict(source_vector=[20., 0.], target_vector=[20., 0.], verified=True,
+                 target_verification={'verified': True}),
+            dict(source_vector=[0., 24.], target_vector=[.3, 24.], verified=True,
+                 target_verification={'verified': True}),
+        ]
+        self.match.result.registration['periodic_completion'] = dict(
+            copies=[dict(geometry_accepted=False, accepted=False)], lattice=axes)
+        for status, verified, calls in (('accepted', True, 1), ('accepted', False, 0),
+                                        ('ambiguous_identity', True, 0)):
+            with self.subTest(status=status, y_verified=verified):
+                axes[1]['target_verification']['verified'] = verified
+                located = LocatedObjects(self.prediction(status), self.inputs.template_valids)
+                complete = Mock()
+                ObjectSupportCompletionStep(complete).run(self.inputs, self.match, located, self.config)
+                self.assertEqual(complete.call_count, calls)
+                if calls:
+                    np.testing.assert_allclose(complete.call_args.args[6], [[.3, 24.]])
+                    self.assertEqual(located.prediction.diagnostics['periodic_lattice'], axes[1:])
+
     def test_ambiguous_crop_retries_identity_with_the_same_valid_pixels(self):
         self.config.ordered_object_class = 2
         self.config.object_visible_count = 3

@@ -79,7 +79,7 @@ def _score(src: Features, dst: Features, H: Matrix, cfg: MatcherConfig, *,
         return dict(empty, structure_ncc=ncc, edge_evaluated=False)
     we = (warped.edges > 0) & valid
     et = (te > 0) & valid
-    if we.sum() < 40 or et.sum() < 40:
+    if we.sum() < cfg.min_edge_pixels or et.sum() < cfg.min_edge_pixels:
         return empty
     distances = _edge_distances(we, et)
     # Symmetric: matching a tiny subset of edges cannot earn a perfect score.
@@ -143,7 +143,7 @@ def _ecc_transform(target: Array, source: Array, valid: Array, cfg: MatcherConfi
     back to the unchanged full-frame call; callers still apply their original
     full-canvas score, geometry and displacement acceptance rules.
     """
-    criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, cfg.ecc_iterations, 1e-5)
+    criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, cfg.ecc_iterations, cfg.ecc_epsilon)
 
     def solve(t, s, mask):
         _, warp = cv2.findTransformECC(t, s, np.eye(2, 3, dtype=np.float32),

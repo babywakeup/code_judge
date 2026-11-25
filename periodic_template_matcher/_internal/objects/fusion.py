@@ -3,21 +3,27 @@
 import numpy as np
 
 from ...config import MatcherConfig
-from ..models import PreparedInputs, RegisteredMatch
+from ..models import MatchResult, PreparedInputs, RegisteredMatch
 from .steps import LocatedObjects
 
 
 class PredictionFusionStep:
     """Snapshot base output and fuse with the configured identity precedence."""
 
+    @staticmethod
+    def capture_base(result: MatchResult) -> None:
+        """Keep the base transfer and its validity before independent contour repairs."""
+        assert result.mapped_labels is not None and result.label_valid is not None
+        result.base_labels = result.mapped_labels.copy()
+        result.base_valid = result.label_valid.copy()
+
     def run(self, inputs: PreparedInputs, match: RegisteredMatch,
             located: LocatedObjects, config: MatcherConfig | None = None) -> None:
         result = match.result
         prediction = located.prediction
         assert result.mapped_labels is not None and result.label_valid is not None
-        # This snapshot includes base periodic fill, but excludes object fusion.
-        result.base_labels = result.mapped_labels.copy()
-        result.base_valid = result.label_valid.copy()
+        if result.base_labels is None:
+            self.capture_base(result)
         result.object_layer_valid = (prediction.labels > 0) & inputs.target_roi
         result.object_labels = np.where(result.object_layer_valid, prediction.labels, 0).astype(np.uint16)
         result.object_layer_identities = np.where(result.object_layer_valid, prediction.identities, 0).astype(np.uint16)
@@ -25,7 +31,7 @@ class PredictionFusionStep:
             semantic_layer = prediction.semantic_foreground & inputs.target_roi
             result.object_labels[semantic_layer] = config.ordered_object_class
             result.object_layer_valid |= semantic_layer
-        foreground = result.base_valid & (result.base_labels > 0)
+        foreground = result.label_valid & (result.mapped_labels > 0)
         overlap = (prediction.labels > 0) & foreground
         prediction.diagnostics['foreground_conflict_pixels'] = int(overlap.sum())
         identity_verified = (config is not None and config.object_visible_count is not None

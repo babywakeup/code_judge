@@ -8,6 +8,8 @@ from .objects.fusion import PredictionFusionStep
 from .objects.steps import ObjectSupportCompletionStep, OrderedObjectStep
 from .registration.step import RegistrationStep
 from .segmentation.instances import complete_periodic_instances
+from .segmentation.occlusion import LatticeOcclusionCompletionStep
+from .segmentation.reference_instances import complete_direct_references
 from .segmentation.transfer import LabelTransferStep, PeriodicCompletionStep
 
 
@@ -29,6 +31,7 @@ class MatchPipeline:
         self.label_transfer = LabelTransferStep()
         self.periodic_completion = PeriodicCompletionStep()
         self.object_support = object_support if object_support is not None else ObjectSupportCompletionStep()
+        self.occlusion_completion = LatticeOcclusionCompletionStep()
         self.fusion = PredictionFusionStep()
 
     def run(self, inputs: PreparedInputs) -> MatchResult:
@@ -60,27 +63,39 @@ class MatchPipeline:
             return match.result
 
         transferred = self.label_transfer.run(inputs, match, self.config)
-        self.periodic_completion.run(inputs, match, transferred, self.config)
         result = match.result
-        if result.label_periodic_valid is not None:
-            result.completion_valid = result.label_periodic_valid.copy()
-            result.completion_labels = np.where(result.completion_valid, result.mapped_labels, 0).astype(np.uint16)
+        complete_direct_references(result, inputs, match.template_index, transferred, self.config)
+        self.periodic_completion.run(inputs, match, transferred, self.config)
+        # Lattice-derived poses become available only after periodic verification.
+        complete_direct_references(result, inputs, match.template_index, transferred, self.config, phase_only=True)
         if located is not None:
-            self.object_support.run(inputs, match, located, self.config)
-            self.fusion.run(inputs, match, located, self.config)
+            self.fusion.capture_base(result)
         alternates = (dict(labels=inputs.labels[index], annotation_valid=inputs.annotation_valids[index],
                            source_valid=inputs.template_valids[index], template_index=index,
                            source_image=inputs.templates[index])
                       for index in result.registration['ranking']
                       if index != match.template_index and inputs.labels[index] is not None)
-        complete_periodic_instances(match.result, inputs.target_roi, self.config,
+        complete_periodic_instances(result, inputs.target_roi, self.config,
             reference=dict(labels=transferred.labels, annotation_valid=transferred.annotation_valid,
                            source_valid=inputs.template_valids[match.template_index],
                            template_index=match.template_index), alternate_references=alternates)
-        # Late, independently verified semantic repairs are also completion
-        # evidence. Do not clear the pre-fusion evidence under object positives.
-        if result.completion_valid is not None:
-            late = result.label_periodic_valid & ~result.completion_valid
-            result.completion_labels[late] = result.mapped_labels[late]
-            result.completion_valid |= late
-        return match.result
+        if located is not None:
+            self.object_support.run(inputs, match, located, self.config)
+        self.occlusion_completion.run(inputs, result, self.config,
+                                      located.prediction if located is not None else None)
+        if transferred.supplemental_background is not None:
+            background = transferred.supplemental_background & (result.mapped_labels == 0)
+            result.direct_valid |= background
+            result.label_valid |= background
+            periodic = result.registration['periodic_completion']
+            missing = int((inputs.target_roi & ~result.label_valid).sum())
+            periodic.update(supplemental_background_pixels=int(background.sum()),
+                            remaining_unknown_pixels=missing,
+                            label_coverage_roi=float(result.label_valid.sum()/inputs.target_roi.sum()),
+                            status=periodic['status'] if missing else 'complete')
+        if result.label_periodic_valid is not None and result.completion_valid is None:
+            result.completion_valid = result.label_periodic_valid.copy()
+            result.completion_labels = np.where(result.completion_valid, result.mapped_labels, 0).astype(np.uint16)
+        if located is not None:
+            self.fusion.run(inputs, match, located, self.config)
+        return result

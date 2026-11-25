@@ -41,6 +41,7 @@ class MatchResult:
     object_labels: LabelMap | None = None
     object_layer_valid: BoolMask | None = None
     object_layer_identities: LabelMap | None = None
+    occlusion_mask: BoolMask | None = None
 
     @property
     def accepted(self) -> bool:
@@ -133,3 +134,4 @@ class TransferredLabels:
 
     labels: LabelMap
     annotation_valid: Mask
+    supplemental_background: BoolMask | None = None

@@ -17,6 +17,32 @@ from tests.helpers import texture
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_low_frequency_ranks_verified_candidates_ahead_of_higher_rejected_scores(self):
+        from periodic_template_matcher._internal.registration import core
+
+        matrix = np.eye(3).tolist()
+        rejected = dict(match_score=57., geometry_accepted=False, absolute_cell_verified=False,
+                        reasons=['score_or_coverage_below_threshold'])
+        original = [dict(rejected, candidates=[dict(match_score=57., matrix_template_to_target=matrix)]
+                                              * n) for n in (2, 1)]
+        scores = [
+            dict(match_score=64., structure_ncc=.69, local_consistency=.68, target_coverage=.95),
+            dict(match_score=61., structure_ncc=.77, local_consistency=.76, target_coverage=.72),
+            dict(match_score=63., structure_ncc=.68, local_consistency=.69, target_coverage=.94),
+        ]
+        cfg = MatcherConfig(robust_appearance=True, template_workers=1)
+        image = texture()
+        with (patch.object(core, '_register_prepared', side_effect=original),
+              patch.object(core, '_score', side_effect=scores)):
+            result = select_templates([image, image], image, cfg)
+        self.assertTrue(result['accepted'])
+        self.assertEqual(result['evidence_mode'], 'low_frequency')
+        self.assertEqual(result['ranking'], [0, 1])
+        self.assertEqual(result['matches'][0]['match_score'], 61.)
+        self.assertEqual(result['matches'][0]['candidates'][1]['match_score'], 64.)
+        self.assertFalse(result['matches'][1]['geometry_accepted'])
+        self.assertIsNone(result['template_score_gap'])
+
     def test_valid_mask_projection_preserves_holes_and_target_bounds(self):
         from periodic_template_matcher.utils import warp_valid_mask
         mask = np.ones((3, 4), np.uint8)

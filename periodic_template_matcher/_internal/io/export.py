@@ -21,7 +21,7 @@ IMAGE_ARTIFACTS = (
     'label_periodic_valid.png', 'object_identities.png', 'object_valid.png',
     'base_labels.png', 'base_valid.png', 'ground_truth.png', 'ground_truth_valid.png',
     'direct_labels.png', 'direct_valid.png', 'completion_labels.png', 'completion_valid.png',
-    'object_labels.png', 'object_layer_valid.png', 'object_layer_identities.png',
+    'object_labels.png', 'object_layer_valid.png', 'object_layer_identities.png', 'occlusion_mask.png',
 )
 
 # Only these owned files are replaced on reruns, including obsolete reports.
@@ -66,6 +66,10 @@ def _plan_export(result: MatchResult | EvaluationResult) -> ExportPlan:
             raise ValueError('ground truth shapes must match input image')
 
     artifacts = {'input': 'input.png', 'geometric_valid': 'geometric_valid.png'}
+    if match.occlusion_mask is not None:
+        if match.occlusion_mask.shape != shape or match.occlusion_mask.dtype != np.bool_:
+            raise ValueError('occlusion_mask must be boolean and match the original input')
+        artifacts['occlusion_mask'] = 'occlusion_mask.png'
     if match.matrix_template_to_target is not None:
         artifacts['transform'] = 'matrix_template_to_target.npy'
     if has_prediction:
@@ -140,6 +144,8 @@ def _write_images(plan: ExportPlan, out: Path, timings: dict[str, float] | None 
 
     write('input', match.input_image)
     write('geometric_valid', match.geometric_valid.astype(np.uint8) * 255)
+    if 'occlusion_mask' in artifacts:
+        write('occlusion_mask', match.occlusion_mask.astype(np.uint8) * 255)
     if 'prediction_mask' in artifacts:
         known = match.label_valid > 0
         for layer in SOURCE_LAYERS:

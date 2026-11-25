@@ -43,6 +43,28 @@ class GalleryTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_defect_overlay_uses_only_the_matcher_artifact(self):
+        row = next(iter(self.catalog.rows.values()))
+        output = self.root / 'prediction'
+        output.mkdir()
+        config = self.root / 'job.json'
+        config.write_text(json.dumps(self.catalog.batch_spec(row['_image'])), encoding='utf-8')
+        metadata = self.runner(config, output)
+        mask = np.zeros(self.image.shape[:2], np.uint8)
+        mask[8:16, 5:23] = 255
+        write_image(output / 'occlusion.png', mask)
+        metadata['artifacts']['occlusion_mask'] = 'occlusion.png'
+        manifest = output / 'result.json'
+        manifest.write_text(json.dumps(metadata), encoding='utf-8')
+        self.catalog.attach(row, manifest)
+        decode = lambda data: cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        plain = decode(self.catalog.preview(row['id'], mode='input'))
+        marked = decode(self.catalog.preview(row['id'], mode='input', defects='1'))
+        self.assertEqual(plain.shape, marked.shape)
+        self.assertEqual(int(plain[8, 13, 2]), 90)
+        self.assertGreater(int(marked[12, 13, 2]), 165)
+        self.assertLess(abs(int(marked[24, 13, 2]) - 90), 12)
+
     @staticmethod
     def runner(config, output):
         spec = json.loads(config.read_text(encoding='utf-8'))

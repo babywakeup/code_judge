@@ -54,6 +54,7 @@
         <label class="inline-field">图层<select id="source"><option value="all">全部来源（重叠混色）</option><option value="fused">最终互斥标签</option><option value="direct">直接匹配</option><option value="periodic">周期补全</option><option value="objects">对象补全</option></select></label>
         <label class="alpha-control">透明度 <input id="alpha" type="range" min="0" max="1" step="0.05" value="0.5"><output id="alphaValue" for="alpha">50%</output></label>
         <label class="check"><input id="unknown" type="checkbox" checked>未知区域</label>
+        <label class="check"><input id="defects" type="checkbox">缺陷标注</label>
         <div class="density-controls"><label class="inline-field">每页<select id="pageSize"><option value="40">40</option><option value="80" selected>80</option><option value="120">120</option><option value="200">200</option></select></label><label class="inline-field">列数<select id="columns"><option value="4">4</option><option value="5" selected>5</option><option value="6">6</option><option value="8">8</option></select></label></div>
       </section>
       <div class="gallery-heading"><span id="rangeInfo">正在读取图像…</span><span id="loadingLabel" role="status" aria-live="polite"></span><span class="muted">点击图像查看详情 · 未运行图像自动显示原图</span></div>
@@ -69,7 +70,8 @@
       <div class="mode-buttons" role="group" aria-label="详情预览模式"><button data-mode="input" type="button" aria-pressed="false">原图</button><button data-mode="overlay" type="button" aria-pressed="true">叠加</button><button data-mode="mask" type="button" aria-pressed="false">掩膜</button><button data-mode="split" type="button" aria-pressed="false">对照</button></div>
       <label class="inline-field">图层<select id="detailSource"><option value="all">全部来源（重叠混色）</option><option value="fused">最终互斥标签</option><option value="direct">直接匹配</option><option value="periodic">周期补全</option><option value="objects">对象补全</option></select></label>
       <label class="alpha-control">透明度 <input id="detailAlpha" type="range" min="0" max="1" step="0.05" value="0.5"><output id="detailAlphaValue" for="detailAlpha">50%</output></label>
-      <label class="check"><input id="detailUnknown" type="checkbox" checked>未知区域</label><button id="detailZoom" class="button small" type="button" aria-pressed="false">高清放大 · 1920px</button>
+      <label class="check"><input id="detailUnknown" type="checkbox" checked>未知区域</label>
+      <label class="check"><input id="detailDefects" type="checkbox">缺陷标注</label><button id="detailZoom" class="button small" type="button" aria-pressed="false">高清放大 · 1920px</button>
     </div>
     <div class="detail-body"><section class="detail-renderer"><div class="render-caption"><span id="renderCaption">预览</span><span>对照模式由服务端并排渲染 · 放大后可拖动 / 滚动</span></div><div id="detailStage" class="detail-stage"><div id="detailImageWrap" class="detail-image-wrap"></div></div><div id="detailNotice" class="detail-notice" role="status">正在读取详情…</div></section><aside class="detail-inspector"><div id="detailStatus"></div><div id="detailStats" class="detail-stats"></div><h3>类别像素统计</h3><div id="classStats" class="class-stats"></div><h3>可下载文件</h3><div id="downloads" class="downloads"></div><p class="muted small-copy">仅显示清单声明的下载文件，不直接访问磁盘路径。</p><details id="metadataDetails"><summary>完整元数据 / 结果 JSON</summary><pre id="metadataJson"></pre></details><div id="resultPath" class="result-path"></div></aside></div>
     <div class="detail-footer"><span>← → 仅切换当前页 · Esc 关闭</span><span>匹配验收 ≠ 缺陷判定</span></div>

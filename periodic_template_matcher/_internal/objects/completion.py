@@ -21,16 +21,16 @@ from .support_anchors import (canonical_support_objects, corroborate_clipped_bri
                               interior_bridges, verified_repeat_regions)
 
 
-def _white_occlusions(gray, valid):
+def _white_occlusions(gray, valid, cfg):
     """Large near-white patches are excluded from evidence, never from output ROI.
 
     Keep isolated highlights/noise as evidence. Connected area and brightness
     describe the white-defect prior, not a license to discard arbitrary mismatch.
     Acceptance still needs contrast and at least half the actual fill pixels.
     """
-    white = ((gray >= 230) & (valid > 0)).astype(np.uint8)
+    white = ((gray >= cfg.object_white_level) & (valid > 0)).astype(np.uint8)
     _, components, stats, _ = cv2.connectedComponentsWithStats(white)
-    large = np.flatnonzero(stats[:, cv2.CC_STAT_AREA] >= 64)
+    large = np.flatnonzero(stats[:, cv2.CC_STAT_AREA] >= cfg.object_white_min_area)
     return np.isin(components, large[large != 0])
 
 
@@ -84,16 +84,16 @@ def complete_object_support(prediction, images, references, source_valids,
     resize_region = RegionResize(shape, ts)
     Db = np.diag([ts[0]/shape[1], ts[1]/shape[0], 1.])
     target_gray = to_gray(target)
-    occluded = _white_occlusions(target_gray, target_valid)
+    occluded = _white_occlusions(target_gray, target_valid, cfg)
     info['occluded_pixels'] = int(occluded.sum())
     evidence_valid = ((target_valid > 0) & ~occluded).astype(np.uint8)
     if not evidence_valid.any():
         return
     tg, tm = ValidRegion.resize_for_matching(target_gray, evidence_valid, ts)
-    dst = _features(tg, tm)
+    dst = _features(tg, tm, cfg=cfg)
     cache = {}
     gray_cache = {}
-    local_cfg = replace(cfg, min_overlap=.2)
+    local_cfg = replace(cfg, min_overlap=cfg.local_min_overlap)
     target_roi = target_valid > 0
     # One residual translation per identity/reference and periodic direction;
     # a failed solve is also cached so fragmented regions cannot trigger it N times.
@@ -133,7 +133,7 @@ def complete_object_support(prediction, images, references, source_valids,
             Da = np.diag([ss[0]/images[ti].shape[1], ss[1]/images[ti].shape[0], 1.])
             gray_cache[ti] = to_gray(images[ti])
             sg, sm = ValidRegion.resize_for_matching(gray_cache[ti], source_valids[ti], ss)
-            cache[ti] = _features(sg, sm), Da
+            cache[ti] = _features(sg, sm, cfg=cfg), Da
         src, Da = cache[ti]
         H = np.asarray(obj['matrix_template_to_target'])
         identity = list(cfg.object_cycle).index(obj['identity'])+1
@@ -173,7 +173,7 @@ def complete_object_support(prediction, images, references, source_valids,
                     annotation &= mapped[band] > 0
                 missing = (prediction.labels[band] == 0 if bridge_only else ~prediction.valid[band])
                 missing &= annotation & target_roi[band]
-                if not missing.any() or (anchor and step and np.count_nonzero(missing) < 64):
+                if not missing.any() or (anchor and step and np.count_nonzero(missing) < cfg.min_contour_pixels):
                     continue
                 fill = np.zeros(shape, bool)
                 if not (bridge_only or (anchor and step)):
@@ -242,7 +242,7 @@ def complete_object_support(prediction, images, references, source_valids,
                 if (anchor and step) or key in attempted:
                     fill[:] = False
                 attempted.add(key)
-                regions = [region for region in component_regions(fill) if region.pixels >= 64]
+                regions = [region for region in component_regions(fill) if region.pixels >= cfg.min_contour_pixels]
                 pending = [(region, False) for region in regions]
                 tile_size = max(16, round(32/scale))
                 group_key = (obj['identity'], ti, ri, tuple(vector))
@@ -251,7 +251,7 @@ def complete_object_support(prediction, images, references, source_valids,
                     region, is_tile = pending.pop()
                     slices, pixels = region.slices, region.pixels
                     local = resize_region(region)
-                    local = cv2.dilate(local, np.ones((25, 25), np.uint8)) & dst[3]
+                    local = cv2.dilate(local, np.ones((cfg.local_context_size,)*2, np.uint8)) & dst[3]
                     # Check original-resolution pixels INSIDE the proposed fill,
                     # but do not ask a white defect to resemble healthy texture.
                     # Enough visible pixels must verify this SAME transform;
@@ -293,7 +293,7 @@ def complete_object_support(prediction, images, references, source_valids,
                                 # single failed tile; each tile is rechecked below.
                                 union = work_support & dst[3]
                                 context = cv2.dilate(cv2.resize((mapped > 0).astype(np.uint8), ts,
-                                    interpolation=cv2.INTER_NEAREST), np.ones((25, 25), np.uint8))
+                                    interpolation=cv2.INTER_NEAREST), np.ones((cfg.local_context_size,)*2, np.uint8))
                                 union &= context
                                 if union.sum() < 1000:
                                     raise cv2.error('Insufficient group support')
@@ -357,14 +357,14 @@ def complete_object_support(prediction, images, references, source_valids,
                             for y in range(int(yy.min()), int(yy.max())+1, tile_size):
                                 for x in range(int(xx.min()), int(xx.max())+1, tile_size):
                                     piece = region.mask[y:y+tile_size, x:x+tile_size]
-                                    if piece.sum() < 64:
+                                    if piece.sum() < cfg.min_contour_pixels:
                                         continue
                                     pending.append((MaskRegion(region.y+y, region.x+x, piece), True))
                 if repeat_fill is not None:
                     # Give verified template support first choice. Splitting a
                     # known region before scoring can lose its original evidence.
                     repeat_fill &= ~approved
-                    if np.count_nonzero(repeat_fill) >= 64:
+                    if np.count_nonzero(repeat_fill) >= cfg.min_contour_pixels:
                         def verify_repeat(region, pixel_ncc, direction):
                             cache_key = tuple(direction * vector)
                             if cache_key not in repeat_warps:
@@ -372,7 +372,7 @@ def complete_object_support(prediction, images, references, source_valids,
                                 transform[:2, 2] = Db[:2, :2] @ (direction * vector)
                                 repeat_warps[cache_key] = ScoreWarp(dst, transform, ts)
                             warped = repeat_warps[cache_key]
-                            local = cv2.dilate(resize_region(region), np.ones((25, 25), np.uint8)) & dst[3]
+                            local = cv2.dilate(resize_region(region), np.ones((cfg.local_context_size,)*2, np.uint8)) & dst[3]
                             metrics = _score(dst, (*dst[:3], local), warped.H, local_cfg, warped=warped)
                             if (metrics['structure_ncc'] < cfg.periodic_min_ncc
                                     or metrics['edge_alignment'] < cfg.periodic_min_edge):

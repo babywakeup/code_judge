@@ -31,7 +31,7 @@ class ObjectPrediction:
     semantic_foreground: BoolMask | None = None
 
 
-def _refinement_features(image, source_valid, target, target_valid, cfg):
+def _refinement_features(image, source_valid, target, target_valid, cfg, *, low_frequency=False):
     """Invariant working images for one source/target pair."""
     scale = cfg.matching_scale(target.shape, image.shape)
     ss = (round(image.shape[1]*scale), round(image.shape[0]*scale))
@@ -40,7 +40,8 @@ def _refinement_features(image, source_valid, target, target_valid, cfg):
     Db = np.diag([ts[0]/target.shape[1], ts[1]/target.shape[0], 1.])
     sg, sm = ValidRegion.resize_for_matching(to_gray(image), source_valid, ss)
     tg, tm = ValidRegion.resize_for_matching(to_gray(target), target_valid, ts)
-    src, dst = _features(sg, sm), _features(tg, tm)
+    src = _features(sg, sm, low_frequency=low_frequency, cfg=cfg)
+    dst = _features(tg, tm, low_frequency=low_frequency, cfg=cfg)
     return ts, Da, Db, src, dst, tm
 
 
@@ -55,7 +56,7 @@ def refine_object_transform(image, mask, source_valid, target, target_valid, mat
     local = cv2.dilate(local, np.ones((9, 9), np.uint8)) & tm
     dst = (*dst[:3], local)
     work = Db @ matrix @ np.linalg.inv(Da)
-    config = replace(cfg, min_overlap=.2)
+    config = replace(cfg, min_overlap=cfg.local_min_overlap)
     proposal = ScoreWarp(src, work, ts)
     before = _score(src, dst, work, config, warped=proposal)
     refinement = (None if _target_refinement is None
@@ -112,11 +113,25 @@ def match_ordered_objects(
     matrices: Sequence[Matrix | Sequence[Sequence[float]] | None], cfg: MatcherConfig,
 ) -> ObjectPrediction:
     """Match a visible cyclic window along the configured x/y layout axis."""
+    prediction = _match_ordered_objects(images, references, source_valids, target, target_valid, matrices, cfg)
+    if (cfg.robust_appearance and any(matrix is not None for matrix in matrices)
+            and prediction.diagnostics['status'] == 'insufficient_evidence'):
+        fallback = _match_ordered_objects(images, references, source_valids, target, target_valid,
+                                          matrices, cfg, low_frequency=True)
+        if fallback.diagnostics['status'] in ('accepted', 'partial_reference'):
+            fallback.diagnostics.update(evidence_mode='low_frequency',
+                                        original_candidate_counts=prediction.diagnostics['candidate_counts'])
+            return fallback
+    return prediction
+
+
+def _match_ordered_objects(images, references, source_valids, target, target_valid, matrices, cfg, *,
+                           low_frequency=False):
     if cfg.object_order_axis == 'y':
-        prediction = match_ordered_objects([transpose_image(im) for im in images],
+        prediction = _match_ordered_objects([transpose_image(im) for im in images],
             [[dict(r, mask=transpose_image(r['mask'])) for r in refs] for refs in references],
             [transpose_image(v) for v in source_valids], transpose_image(target), transpose_image(target_valid),
-            [transpose_matrix(m) for m in matrices], transpose_config(cfg))
+            [transpose_matrix(m) for m in matrices], transpose_config(cfg), low_frequency=low_frequency)
         return transpose_prediction(prediction)
     shape = target.shape[:2]
     labels = np.zeros(shape, np.uint16)
@@ -130,7 +145,7 @@ def match_ordered_objects(
     ts = (round(shape[1]*scale), round(shape[0]*scale))
     Db = np.diag([ts[0]/shape[1], ts[1]/shape[0], 1.])
     tg, tm = ValidRegion.resize_for_matching(to_gray(target), target_valid, ts)
-    target_features = _features(tg, tm)
+    target_features = _features(tg, tm, low_frequency=low_frequency, cfg=cfg)
     tf = target_features[0]
     target_roi = target_valid > 0
     source_features = {}
@@ -144,7 +159,7 @@ def match_ordered_objects(
         Da = np.diag([ss[0]/image.shape[1], ss[1]/image.shape[0], 1.])
         if ti not in source_features:
             sg, sm = ValidRegion.resize_for_matching(to_gray(image), source_valid, ss)
-            source_features[ti] = _features(sg, sm)
+            source_features[ti] = _features(sg, sm, low_frequency=low_frequency, cfg=cfg)
             source_masks[ti] = sm
             # Local refinement historically uses the pair's matching scale.
             # Reuse only when identical; differently sized templates must keep
@@ -171,7 +186,7 @@ def match_ordered_objects(
             mask = cv2.warpPerspective(mask, linear, canvas_size, flags=cv2.INTER_NEAREST)
             context = cv2.dilate(mask, np.ones((9, 9), np.uint8)) & aligned_valid
             yy, xx = np.where(context > 0)
-            if len(xx) < 64:
+            if len(xx) < cfg.object_min_work_pixels:
                 continue
             x0, x1, y0, y1 = xx.min(), xx.max()+1, yy.min(), yy.max()+1
             patch, weight = aligned[y0:y1, x0:x1], context[y0:y1, x0:x1]
@@ -188,7 +203,7 @@ def match_ordered_objects(
                 visible = warp_valid_mask(raw, H, target.shape) & target_roi
                 visible_pixels = visible.sum()
                 fraction = min(1., float(visible_pixels/max(raw_pixels*abs(np.linalg.det(H[:2, :2])), 1)))
-                if fraction < cfg.object_min_visible or visible_pixels < 64:
+                if fraction < cfg.object_min_visible or visible_pixels < cfg.min_contour_pixels:
                     continue
                 vertical_fraction = min(1., float(np.any(visible, axis=1).sum()/max(
                     raw_height*np.linalg.norm(H[:2, 1]), 1)))
@@ -262,7 +277,8 @@ def match_ordered_objects(
                 raw = ((references[ti][ri]['mask'] > 0) & (source_valids[ti] > 0)).astype(np.uint8)
                 initial = np.asarray(candidate['matrix_template_to_target'])
                 if ti not in refinement_features:
-                    refinement_features[ti] = _refinement_features(images[ti], source_valids[ti], target, target_valid, cfg)
+                    refinement_features[ti] = _refinement_features(
+                        images[ti], source_valids[ti], target, target_valid, cfg, low_frequency=low_frequency)
                 pair_features = refinement_features[ti]
                 target_key = id(pair_features[4][0])
                 if target_key not in refinement_targets:
@@ -278,7 +294,7 @@ def match_ordered_objects(
                             translation = np.eye(3)
                             translation[:2, 2] = pair_features[1][:2, :2] @ source_shift
                             evidence = _score(pair_features[3], pair_features[3], translation,
-                                              replace(cfg, min_overlap=.2))
+                                              replace(cfg, min_overlap=cfg.local_min_overlap))
                             if (evidence['structure_ncc'] >= cfg.periodic_min_ncc
                                     and evidence['edge_alignment'] >= cfg.periodic_min_edge):
                                 shared = adjusted @ np.linalg.inv(anchor) @ initial

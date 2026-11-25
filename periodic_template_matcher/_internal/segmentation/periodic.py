@@ -15,6 +15,7 @@ from ..registration.core import _features
 from ..registration.scoring import ScoreWarp, _refine, _score, prepare_refinement_target
 from ..models import MatchResult
 from .lattice import calibrate_lattice
+from .layers import projected_components, record_periodic_prediction
 from .regions import RegionResize, component_regions
 
 
@@ -75,6 +76,12 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
     H = result.matrix_template_to_target
     h, w = target.shape[:2]
     best = result.registration['matches'][result.registration['ranking'][0]]
+    low_frequency = best.get('evidence_mode') == 'low_frequency'
+    if low_frequency:
+        # Filtered edges are coarser and fewer. Require stronger structure on
+        # this path, which is entered only after filtered registration passes.
+        cfg = replace(cfg, periodic_min_ncc=max(cfg.periodic_min_ncc, cfg.periodic_low_frequency_min_ncc),
+                      periodic_min_edge=min(cfg.periodic_min_edge, cfg.periodic_low_frequency_edge_cap))
     scale = cfg.matching_scale(source.shape, target.shape)
     ss = (round(source.shape[1]*scale), round(source.shape[0]*scale))
     ts = (round(w*scale), round(h*scale))
@@ -102,14 +109,17 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
     if not vectors:
         period_source = 'image_autocorrelation'
         vectors = image_vectors()
-    result.completed_template = result.warped_template.copy()
-    result.completed_valid = result.geometric_valid.copy()
+    if result.completed_template is None:
+        result.completed_template = result.warped_template.copy()
+        result.completed_valid = result.geometric_valid.copy()
     result.periodic_valid = np.zeros((h, w), bool)
     result.label_periodic_valid = np.zeros((h, w), bool)
     total = int(target_valid.sum())
     info = dict(status='incomplete', period_source=period_source,
                 period_vectors=[v.tolist() for v in vectors], copies=[],
                 direct_label_pixels=int(result.label_valid.sum()), target_valid_pixels=total)
+    if low_frequency:
+        info['evidence_mode'] = 'low_frequency'
     # The ordered class has its own identity-aware validity; it must not block
     # independent base background. Every other declared/observed class matters.
     policy_classes = ({int(c) for c in np.unique(labels) if c > 0}
@@ -140,9 +150,9 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         return
     source_gray, source_mask = ValidRegion.resize_for_matching(to_gray(source), source_valid, ss)
     target_gray, target_mask = ValidRegion.resize_for_matching(to_gray(target), target_valid, ts)
-    src = _features(source_gray, source_mask)
-    dst = _features(target_gray, target_mask)
-    local_cfg = replace(cfg, min_overlap=.2)
+    src = _features(source_gray, source_mask, low_frequency=low_frequency, cfg=cfg)
+    dst = _features(target_gray, target_mask, low_frequency=low_frequency, cfg=cfg)
+    local_cfg = replace(cfg, min_overlap=cfg.local_min_overlap)
     if period_source == 'anchor_class':
         # One class may contain different objects inside a periodic cell. Their
         # closest centroid spacing is not necessarily a period of the photograph.
@@ -273,7 +283,7 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
                       else ScoreWarp(src, candidate_work, ts))
         for region in component_regions(fill_labels):
             local = resize_region(region)
-            local = cv2.dilate(local, np.ones((25, 25), np.uint8)) & dst[3]
+            local = cv2.dilate(local, np.ones((cfg.local_context_size,)*2, np.uint8)) & dst[3]
             local_dst = (dst[0], dst[1], dst[2], local)
             local_metrics = _score(src, local_dst, candidate_work, local_cfg, warped=score_warp,
                                    min_structure_ncc=cfg.periodic_min_ncc)
@@ -286,6 +296,8 @@ def complete_periodic(result: MatchResult, labels: LabelMap, annotation_valid: M
         record['accepted'] = bool(fill_labels.any())
         if not fill_labels.any():
             continue
+        record_periodic_prediction(result, mapped,
+                                   projected_components(mapped, ann & target_valid, approved))
         record['newly_covered_pixels'] = int((fill_labels & ~result.label_valid).sum())
         record['boundary_foreground_pixels'] = int((fill_labels & result.label_valid).sum())
         result.mapped_labels[fill_labels] = mapped[fill_labels]

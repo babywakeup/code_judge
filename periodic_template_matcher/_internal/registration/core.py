@@ -59,7 +59,7 @@ def prepare_registration_sources(templates: Sequence[Image], valids: Sequence[Ma
 
 
 def _prepare_image(image: Image, valid: Mask | None, cfg: MatcherConfig,
-                   scale: float) -> PreparedImage:
+                   scale: float, *, low_frequency: bool = False) -> PreparedImage:
     gray = to_gray(image)
     mask = build_valid_mask(gray, valid, cfg)
     size = (round(gray.shape[1] * scale), round(gray.shape[0] * scale))
@@ -67,19 +67,21 @@ def _prepare_image(image: Image, valid: Mask | None, cfg: MatcherConfig,
         raise ValueError('Extreme image aspect/size mismatch; use comparable fields of view')
     to_work = np.diag([size[0] / gray.shape[1], size[1] / gray.shape[0], 1.0])
     gray, mask = ValidRegion.resize_for_matching(gray, mask, size)
-    features = _features(gray, mask) if np.std(gray[mask > 0]) >= 2 else None
-    if features is not None and features[2].sum() < 40:
+    features = (_features(gray, mask, low_frequency=low_frequency, cfg=cfg)
+                if np.std(gray[mask > 0]) >= cfg.min_gray_std else None)
+    if features is not None and features[2].sum() < cfg.min_edge_pixels:
         features = None
     return PreparedImage(gray.shape, to_work, scale, features)
 
 
-def _features(gray: Image, mask: Mask) -> Features:
-    x = gray.astype(np.float32) / 255.0
+def _features(gray: Image, mask: Mask, *, low_frequency: bool = False,
+              cfg: MatcherConfig | None = None) -> Features:
     # Repair excluded overlays before filtering to avoid leaking text/borders.
     if not mask.all():
-        repaired = cv2.inpaint(gray, (1 - mask) * 255, 3, cv2.INPAINT_TELEA)
-        gray = repaired
-        x = repaired.astype(np.float32) / 255.0
+        gray = cv2.inpaint(gray, (1 - mask) * 255, 3, cv2.INPAINT_TELEA)
+    if low_frequency:
+        gray = cv2.GaussianBlur(gray, (0, 0), 1.8)
+    x = gray.astype(np.float32) / 255.0
     x = cv2.GaussianBlur(x, (0, 0), 0.8)
     mean = cv2.GaussianBlur(x, (0, 0), 9)
     var = np.maximum(cv2.GaussianBlur(x * x, (0, 0), 9) - mean * mean, 0)
@@ -90,7 +92,9 @@ def _features(gray: Image, mask: Mask) -> Features:
     cap = max(float(np.percentile(grad[mask > 0], 95)), 1e-5)
     grad = np.minimum(grad / cap, 1).astype(np.float32)
     safe = cv2.erode(mask, np.ones((7, 7), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
-    edges = ((cv2.Canny(gray, 35, 100) > 0) & (safe > 0)).astype(np.uint8)
+    cfg = cfg or MatcherConfig()
+    thresholds = cfg.low_frequency_canny_thresholds if low_frequency else cfg.canny_thresholds
+    edges = ((cv2.Canny(gray, *thresholds) > 0) & (safe > 0)).astype(np.uint8)
     return norm.astype(np.float32) * safe, grad * safe, edges, safe
 
 
@@ -136,7 +140,7 @@ def _coarse_candidates(src: Features, dst: Features, cfg: MatcherConfig) -> list
                 coarse.append((merit, H))
     shortlist = []
     for _, H in sorted(coarse, key=lambda item: item[0], reverse=True):
-        if all(_transform_difference(H, previous, shape) > 4 for previous in shortlist):
+        if all(_transform_difference(H, previous, shape) > cfg.coarse_min_separation_px for previous in shortlist):
             shortlist.append(H)
         if len(shortlist) >= cfg.refine_candidates:
             break
@@ -160,7 +164,8 @@ def _refine_candidates(source: PreparedImage, target: PreparedImage,
             H, metrics = refined, refined_metrics
         else:
             ecc_ok = False
-        if all(_transform_difference(H, np.asarray(c['_H_work']), source.shape) > 3 for c in candidates):
+        if all(_transform_difference(H, np.asarray(c['_H_work']), source.shape) > cfg.refined_min_separation_px
+               for c in candidates):
             metrics.update(_H_work=H.tolist(), ecc_converged=bool(ecc_ok),
                            matrix_template_to_target=(to_original @ H @ source.to_work).tolist())
             candidates.append(metrics)
@@ -211,6 +216,47 @@ def _template_worker_count(template_count: int, requested: int) -> int:
     return max(1, min(template_count, os.cpu_count() or 1, requested or 4))
 
 
+def _verified_score(result):
+    return result['geometry_accepted'], result['match_score']
+
+
+def _score_gap(ranked):
+    return ranked[0]['match_score'] - ranked[1]['match_score'] if len(ranked) > 1 else None
+
+
+def _rescore_low_frequency(matches, templates, target, template_valids, target_valid, cfg, scale):
+    """Verify the existing candidate poses against coarser image structure."""
+    dst = _prepare_image(target, target_valid, cfg, scale, low_frequency=True)
+    if dst.features is None:
+        return None
+    ranked = []
+    for match, image, valid in zip(matches, templates, template_valids):
+        rescored = dict(match, geometry_accepted=False, match_score=0.)
+        ranked.append(rescored)
+        if not match['candidates']:
+            continue
+        src = _prepare_image(image, valid, cfg, scale, low_frequency=True)
+        if src.features is None:
+            continue
+        candidates = []
+        for candidate in match['candidates']:
+            work = dst.to_work @ np.asarray(candidate['matrix_template_to_target']) @ np.linalg.inv(src.to_work)
+            metrics = _score(src.features, dst.features, work, cfg)
+            accepted = (metrics['match_score'] >= cfg.min_score and metrics['target_coverage'] >= cfg.min_overlap
+                        and metrics['structure_ncc'] >= cfg.robust_min_ncc
+                        and metrics['local_consistency'] >= cfg.robust_min_local_consistency)
+            candidates.append(dict(candidate, **metrics, geometry_accepted=bool(accepted),
+                                   original_match_score=candidate['match_score']))
+        candidates.sort(key=_verified_score, reverse=True)
+        rescored.update(candidates[0], candidates=candidates,
+                        candidate_score_gap=_score_gap([c for c in candidates if c['geometry_accepted']]),
+                        evidence_mode='low_frequency', absolute_cell_verified=False)
+        if rescored['geometry_accepted']:
+            rescored['reasons'] = [reason for reason in match['reasons']
+                                   if reason != 'score_or_coverage_below_threshold']
+    return ranked
+
+
 def select_templates(templates: Sequence[Image], target: Image,
                      cfg: MatcherConfig | None = None,
                      template_valids: Sequence[Mask | None] | None = None,
@@ -255,8 +301,15 @@ def select_templates(templates: Sequence[Image], target: Image,
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='template-match') as pool:
             matches = list(pool.map(match_one, range(len(templates))))
     ranked = sorted(matches, key=lambda r: r['match_score'], reverse=True)
+    gap = _score_gap(ranked)
+    if (cfg.robust_appearance and label_mode == 'semantic' and not ranked[0]['geometry_accepted']
+            and any(match['candidates'] for match in matches)):
+        fallback = _rescore_low_frequency(matches, templates, target, template_valids, target_valid, cfg, common_scale)
+        if fallback is not None and any(match['geometry_accepted'] for match in fallback):
+            matches = fallback
+            ranked = sorted(matches, key=_verified_score, reverse=True)
+            gap = _score_gap([match for match in ranked if match['geometry_accepted']])
     best = ranked[0]
-    gap = best['match_score'] - ranked[1]['match_score'] if len(ranked) > 1 else None
     chosen = best['template_index'] if best['geometry_accepted'] else None
     separated = gap is None or gap >= cfg.min_template_gap
     visual_ok = bool(chosen is not None and separated)
@@ -265,6 +318,7 @@ def select_templates(templates: Sequence[Image], target: Image,
     status = 'accepted' if accepted else ('low_match_score' if chosen is None else
              'templates_too_close' if not separated else 'absolute_cell_unverified')
     return dict(best_template_index=chosen, accepted=accepted, status=status,
+                evidence_mode=best.get('evidence_mode', 'standard'),
                 label_mode=label_mode, template_score_gap=gap,
                 absolute_mapping_accepted=absolute_ok, ranking=[r['template_index'] for r in ranked],
                 matches=matches, config=asdict(cfg),

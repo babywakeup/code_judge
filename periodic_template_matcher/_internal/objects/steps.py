@@ -70,13 +70,26 @@ class ObjectSupportCompletionStep:
         # Geometry approval differs from label-copy acceptance. The object kernel
         # independently validates every actual support fill, including occlusion.
         approved = [c for c in periodic.get('copies', []) if c.get('geometry_accepted', c.get('accepted'))]
-        if not approved:
-            return
-        assert match.matrix is not None
-        target_vectors = [(match.matrix[:2, :2] @ np.asarray(v)).tolist()
-                          for v in periodic.get('period_vectors', [])]
-        source_vectors = periodic.get('period_vectors', [])
         lattice = periodic.get('lattice', []) if config.shared_periods else []
+        if approved:
+            assert match.matrix is not None
+            source_vectors = periodic.get('period_vectors', [])
+            target_vectors = [(match.matrix[:2, :2] @ np.asarray(v)).tolist() for v in source_vectors]
+        else:
+            if located.prediction.diagnostics.get('status') not in ('accepted', 'partial_reference'):
+                return
+            # A global semantic copy can fail even when the target repeats
+            # accurately. Already located identities can use that independent
+            # period as a proposal and still validate their actual local fills.
+            lattice = [axis for axis in lattice if axis.get('verified')
+                       and axis.get('target_verification', {}).get('verified')
+                       and support_vectors([axis['target_vector']], config,
+                                           source_vectors=[axis['source_vector']])]
+            if not lattice:
+                return
+            source_vectors = [axis['source_vector'] for axis in lattice]
+            target_vectors = [axis['target_vector'] for axis in lattice]
+            located.prediction.diagnostics['support_geometry_source'] = 'verified_target_period'
         if lattice and len(lattice) == len(target_vectors):
             target_vectors = [axis['target_vector'] for axis in lattice]
             # Keep source-axis provenance: a source-y period may be diagonal in

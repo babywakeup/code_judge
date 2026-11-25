@@ -181,6 +181,8 @@ class MaskLayerTests(unittest.TestCase):
         pred = case.prediction()
         pred.labels[20:24, 20:24] = 2
         pred.identities[20:24, 20:24] = 1
+        pred.labels[30:34, 30:34] = 2
+        pred.identities[30:34, 30:34] = 1
         located = LocatedObjects(pred, case.inputs.template_valids)
         pipeline = MatchPipeline(case.config, registration=Mock(run=Mock(return_value=case.match)),
                                  ordered_objects=Mock(run=Mock(return_value=located)),
@@ -191,6 +193,7 @@ class MaskLayerTests(unittest.TestCase):
             result.label_periodic_valid[20:24, 20:24] = True
             result.mapped_labels[20:24, 20:24] = 1
         def late(result, *args, **kwargs):
+            self.assertIsNone(result.object_labels)
             result.mapped_labels[30:34, 30:34] = 1
             result.label_periodic_valid[30:34, 30:34] = True
         pipeline.periodic_completion.run = periodic
@@ -201,6 +204,7 @@ class MaskLayerTests(unittest.TestCase):
         np.testing.assert_array_equal(result.completion_labels[20:24, 20:24], 1)
         np.testing.assert_array_equal(result.mapped_labels[20:24, 20:24], 2)
         np.testing.assert_array_equal(result.completion_labels[30:34, 30:34], 1)
+        np.testing.assert_array_equal(result.mapped_labels[30:34, 30:34], 2)
 
     def test_crop_restores_every_new_layer_to_original_coordinates(self):
         from periodic_template_matcher._internal.segmentation.crop import restore_crop
@@ -259,16 +263,12 @@ class MaskLayerTests(unittest.TestCase):
                                & (result.object_labels == 2) & result.object_layer_valid)
                     if i == 0:
                         self.assertGreater(int(overlap.sum()), 64)
-                        self.assertTrue((result.mapped_labels[overlap] == 2).all())
-                    else:
-                        # This image does NOT reproduce the same overlap loss;
-                        # preserve that counterevidence rather than inventing it.
-                        self.assertFalse(overlap.any())
+                    self.assertTrue((result.mapped_labels[overlap] == 2).all())
                     saved = load_result(matcher.save_result(result, Path(tmp)/str(i)))
                     np.testing.assert_array_equal(saved.direct_labels, result.direct_labels)
                     np.testing.assert_array_equal(saved.object_labels, result.object_labels)
-                    evidence = overlap if overlap.any() else ((result.completion_labels == 1)
-                                                             & result.completion_valid)
+                    evidence = overlap if overlap.sum() > 64 else ((result.completion_labels == 1)
+                                                                  & result.completion_valid)
                     points = np.argwhere(evidence)
                     self.assertGreater(len(points), 64)
                     y, x = points[len(points)//2]

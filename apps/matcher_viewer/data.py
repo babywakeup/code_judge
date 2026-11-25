@@ -41,6 +41,27 @@ def artifact_path(manifest: Path, metadata: dict, kind: str) -> Path:
     return path
 
 
+def _draw_predicted_occlusion(image, row, original_shape, scale, *, split):
+    import cv2
+    import numpy as np
+    from periodic_template_matcher.utils import read_image
+
+    try:
+        path = artifact_path(row['_manifest'], row['_metadata'], 'occlusion_mask')
+        mask = read_image(path, cv2.IMREAD_GRAYSCALE)
+    except (OSError, ValueError):
+        return
+    if mask.shape != original_shape:
+        return
+    height, width = image.shape[:2]
+    pane_width = width // 2 if split else width
+    transform = np.array([[scale, 0., 0.], [0., scale, 0.]])
+    selected = cv2.warpAffine(mask, transform, (pane_width, height), flags=cv2.INTER_NEAREST) > 0
+    for offset in (0, pane_width) if split else (0,):
+        pane = image[:, offset:offset+pane_width]
+        pane[selected] = np.rint(.45*pane[selected] + .55*np.array([35, 65, 255])).astype(np.uint8)
+
+
 def inspect_manifest(manifest: Path) -> dict:
     metadata = read_json(manifest)
     ranking, matches = metadata.get('ranking'), metadata.get('matches')
@@ -248,7 +269,8 @@ class Catalog:
                         result_path=str(row['_manifest']) if row['_manifest'] else None,
                         artifacts=row['_metadata'].get('artifacts', {}) if row['_metadata'] else {})
 
-    def preview(self, identifier, mode='overlay', width='480', alpha='.5', source='all', unknown='1', **extra):
+    def preview(self, identifier, mode='overlay', width='480', alpha='.5', source='all',
+                unknown='1', defects='0', **extra):
         if mode not in ('input', 'overlay', 'mask', 'split') or source not in ('all', 'fused', 'direct', 'periodic', 'objects'):
             raise ValueError('无效预览模式')
         width, alpha = max(64, min(1920, int(width))), float(alpha)
@@ -257,7 +279,7 @@ class Catalog:
         with self.lock:
             row = dict(self.rows[identifier])
         stamp = row['_manifest'].stat().st_mtime_ns if row['_manifest'] else row['_fingerprint']
-        key = (identifier, stamp, mode, width, alpha, source, unknown)
+        key = (identifier, stamp, mode, width, alpha, source, unknown, defects)
         with self.preview_lock:
             if key in self.previews:
                 self.previews.move_to_end(key)
@@ -281,6 +303,8 @@ class Catalog:
                                     alpha=alpha, source=source, show_unknown=unknown == '1')
             else:
                 image = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+            if defects == '1' and prediction is not None:
+                _draw_predicted_occlusion(image, row, prediction.image.shape[:2], scale, split=mode == 'split')
             ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ok:
                 raise ValueError('预览编码失败')

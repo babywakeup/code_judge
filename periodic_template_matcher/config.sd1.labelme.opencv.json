@@ -45,29 +45,37 @@
         "description": "类别2：完整身份周期为ABCD，输入横向只出现连续3个身份，边缘允许截断；联合所有模板参考定位，横向不复制，纵向可验证补全。",
         "repeat_axes": ["y"],
         "instance_matching": {
+          "description": "min_score 是身份候选最低分，min_gap 是顺序方案最低分差，min_visible 是最小可见比例，candidates 是每个身份保留的候选数，spacing_weight 是间距一致性的权重。min_work_pixels 是候选最少工作像素数，min_variance 是归一化纹理方差下限。",
           "cycle": ["A", "B", "C", "D"],
           "visible_count": 3,
-          "min_score": 0.7,
+          "min_score": 0.67,
           "min_gap": 0.0,
           "min_visible": 0.15,
+          "candidates": 8,
+          "min_work_pixels": 64,
+          "min_variance": 0.0025,
           "spacing_weight": 0.3
         }
       }
     },
     "step1": {
-      "description": "预处理：先裁剪模板与输入图像的公共有效区域，再统一缩放。边界采用原图坐标，包含起点，不包含终点。",
+      "description": "先裁剪有效区域再缩放。边界采用原图坐标，包含起点；canny_thresholds 和 low_frequency_canny_thresholds 分别是常规与低频特征的 Canny 低、高阈值。",
       "valid_x_start": 0,
       "valid_x_end": null,
       "valid_y_start": 0,
       "valid_y_end": 1891,
       "max_side": 640,
-      "scale": null
+      "scale": null,
+      "canny_thresholds": [35, 100],
+      "low_frequency_canny_thresholds": [12, 36]
     },
     "step2": {
-      "description": "粗匹配：在缩放后的图像上枚举模板的 angles 和 scales 组合，搜索平移位置并生成候选。",
+      "description": "粗匹配枚举 angles（度）和 scales（倍率）。peaks_per_hypothesis 是每组保留的平移峰数，coarse_min_separation_px 是候选去重距离（工作像素），template_workers=0 表示自动并行，seed 是随机种子。",
       "backend": "opencv",
       "template_workers": 0,
+      "seed": 7,
       "peaks_per_hypothesis": 3,
+      "coarse_min_separation_px": 4.0,
       "angles": [
         0
       ],
@@ -76,20 +84,59 @@
       ]
     },
     "step3": {
-      "description": "精配准与判定：使用 ECC 优化候选，根据重叠率、分数和候选差距判定结果，最终变换换算回原图坐标。",
+      "description": "精配准验收。min_overlap 是最小有效重叠比例，min_score 是百分制最低分，两个 gap 分别为模板与同模板候选的最小分差。edge_tolerance_px 与 refined_min_separation_px 使用工作像素。ecc_epsilon 是 ECC 收敛阈值，min_gray_std 和 min_edge_pixels 是最小灰度标准差及边缘像素数。低频复核另用 robust_min_ncc 和 robust_min_local_consistency。",
       "min_overlap": 0.45,
       "min_score": 60,
-      "min_template_gap": 1,
+      "min_template_gap": 0,
+      "min_candidate_gap": 2.0,
+      "edge_tolerance_px": 2.0,
+      "refined_min_separation_px": 3.0,
+      "min_gray_std": 2.0,
+      "min_edge_pixels": 40,
       "refine_candidates": 8,
       "ecc_iterations": 70,
-      "ecc_roi": true
+      "ecc_epsilon": 0.00001,
+      "ecc_roi": true,
+      "robust_appearance": true,
+      "robust_min_ncc": 0.75,
+      "robust_min_local_consistency": 0.7
     },
     "periodic": {
-      "description": "启用周期补全，方向权限由classes中各类别的repeat_axes声明；周期像素距离独立自动估计，保留已有前景和白色缺陷下的标签迁移。",
+      "description": "周期位移方向由 repeat_axes 限制。period_vectors 为空时自动估计，显式向量使用模板原图像素。periodic_min_ncc 和 periodic_min_edge 分别为结构相关性和边缘得分下限。local_min_overlap 是局部验证最小重叠率，local_context_size 为工作分辨率窗口边长，min_contour_pixels 为轮廓筛选像素数。低频复核使用单独的结构下限和边缘门槛上限。",
       "periodic_completion": true,
       "shared_periods": true,
       "periodic_max_steps": 1,
-      "periodic_min_ncc": 0.72
+      "periodic_min_ncc": 0.67,
+      "periodic_min_edge": 0.6,
+      "period_vectors": [],
+      "periodic_anchor_class": 1,
+      "local_min_overlap": 0.2,
+      "local_context_size": 25,
+      "min_contour_pixels": 64,
+      "periodic_low_frequency_min_ncc": 0.75,
+      "periodic_low_frequency_edge_cap": 0.45
+    },
+    "occlusion": {
+      "description": "遮挡候选。texture_window、tone_sigma 和各 close/anchor_window 使用工作分辨率像素，两个 area 使用工作像素面积。texture_floor 和 texture_floor_ratio 共同限制参考纹理强度，texture_ratio 是当前与同相位位置的纹理强度比上限。dark_ratio 是灰度比例上限，dark_delta 是 8 位灰度最小下降量。anchor_visible、anchor_variance、anchor_ncc 分别限制可见比例、归一化方差和结构相关性，anchor_max_period_ratio 限制候选到可见锚点的最大距离。object_white_level 和 object_white_min_area 用于对象分支的白斑排除，面积使用原图像素。",
+      "occlusion_texture_window": 17,
+      "occlusion_texture_floor": 2.0,
+      "occlusion_texture_floor_ratio": 0.65,
+      "occlusion_texture_ratio": 0.62,
+      "occlusion_tone_sigma": 5.0,
+      "occlusion_dark_ratio": 0.75,
+      "occlusion_dark_delta": 16.0,
+      "occlusion_texture_area": 96,
+      "occlusion_dark_area": 384,
+      "occlusion_texture_close": 9,
+      "occlusion_dark_close": 13,
+      "occlusion_envelope_close": 25,
+      "occlusion_anchor_window": 31,
+      "occlusion_anchor_visible": 0.7,
+      "occlusion_anchor_variance": 0.01,
+      "occlusion_anchor_ncc": 0.85,
+      "occlusion_anchor_max_period_ratio": 0.5,
+      "object_white_level": 230,
+      "object_white_min_area": 64
     }
   }
 }

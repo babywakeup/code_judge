@@ -12,7 +12,7 @@
   const state = {
     items: [], total: 0, offset: 0, limit: 80, columns: 5, filters: {},
     selected: new Set(), cards: new Map(), summary: null, token: null,
-    view: {mode: 'overlay', alpha: '0.5', source: 'all', unknown: true},
+    view: {mode: 'overlay', alpha: '0.5', source: 'all', unknown: true, defects: false},
     listController: null, listVersion: 0, loading: false, listLoaded: false, invalidFilters: false,
     summaryController: null, summaryVersion: 0, pollTimer: null,
     actionController: null, actionBusy: false, actionKind: '', filterVersion: 0,
@@ -102,6 +102,7 @@
         if (['all', 'fused', 'direct', 'periodic', 'objects'].includes(saved.view.source)) state.view.source = saved.view.source;
         if (finite(saved.view.alpha)) state.view.alpha = String(Math.max(0, Math.min(1, Number(saved.view.alpha))));
         if (typeof saved.view.unknown === 'boolean') state.view.unknown = saved.view.unknown;
+        if (typeof saved.view.defects === 'boolean') state.view.defects = saved.view.defects;
       }
       if (typeof saved.skipCompleted === 'boolean') $('skipCompleted').checked = saved.skipCompleted;
     } catch (_) { /* Ignore malformed or inaccessible saved settings. */ }
@@ -114,6 +115,7 @@
     for (const id of ['alpha', 'detailAlpha']) $(id).value = state.view.alpha;
     for (const id of ['alphaValue', 'detailAlphaValue']) $(id).textContent = `${Math.round(Number(state.view.alpha) * 100)}%`;
     for (const id of ['unknown', 'detailUnknown']) $(id).checked = state.view.unknown;
+    for (const id of ['defects', 'detailDefects']) $(id).checked = state.view.defects;
     $('detailZoom').setAttribute('aria-pressed', String(state.zoom));
     $('detailZoom').textContent = state.zoom ? '适应窗口' : '高清放大 · 1920px';
     $('detailStage').classList.toggle('zoomed', state.zoom);
@@ -129,6 +131,7 @@
   function previewUrl(row, width, rev) {
     const mode = effectiveMode(row);
     const params = new URLSearchParams({mode, width: String(width)});
+    if (state.view.defects) params.set('defects', '1');
     if (mode !== 'input') {
       params.set('alpha', state.view.alpha); params.set('source', state.view.source);
       params.set('unknown', state.view.unknown ? '1' : '0');
@@ -162,6 +165,7 @@
       if (effectiveMode(card.row) !== 'input' && !image.dataset.fallback) {
         image.dataset.fallback = '1'; card.placeholder.textContent = '结果预览不可用，读取原图…';
         const params = new URLSearchParams({mode: 'input', width: '480'});
+        if (state.view.defects) params.set('defects', '1');
         image.src = `/preview/${encodeURIComponent(card.row.id)}?${params}`;
       } else {
         image.hidden = true; card.placeholder.hidden = false;
@@ -564,7 +568,7 @@
       $('classStats').append(row);
     }
     $('downloads').replaceChildren();
-    const labels = {input: '↓ 原图', input_image: '↓ 原图', prediction: '↓ 预测掩膜', prediction_mask: '↓ 最终互斥标签', predicted_mask: '↓ 预测掩膜', mask: '↓ 掩膜', input_mask: '↓ 输入掩膜', manifest: '↓ 结果清单', direct_labels: '↓ 直接匹配标签', direct_valid: '↓ 直接匹配有效区', completion_labels: '↓ 周期补全标签', completion_valid: '↓ 周期补全有效区', object_labels: '↓ 独立对象标签', object_layer_valid: '↓ 独立对象有效区', object_layer_identities: '↓ 独立对象身份'};
+    const labels = {occlusion_mask: '↓ 遮挡候选', input: '↓ 原图', input_image: '↓ 原图', prediction: '↓ 预测掩膜', prediction_mask: '↓ 最终互斥标签', predicted_mask: '↓ 预测掩膜', mask: '↓ 掩膜', input_mask: '↓ 输入掩膜', manifest: '↓ 结果清单', direct_labels: '↓ 直接匹配标签', direct_valid: '↓ 直接匹配有效区', completion_labels: '↓ 周期补全标签', completion_valid: '↓ 周期补全有效区', object_labels: '↓ 独立对象标签', object_layer_valid: '↓ 独立对象有效区', object_layer_identities: '↓ 独立对象身份'};
     const kinds = artifactKinds(item);
     for (const kind of kinds) {
       const link = el('a', labels[kind] || `↓ ${kind}`, 'download-link');
@@ -605,7 +609,9 @@
       if (!image.dataset.fallback && effectiveMode(item) !== 'input') {
         image.dataset.fallback = 'input';
         $('detailNotice').textContent = '结果预览不可用，已回退到原图。'; $('detailNotice').classList.add('warning');
-        image.src = `/preview/${encodeURIComponent(item.id)}?mode=input&width=${state.zoom ? 1920 : 960}`;
+        const params = new URLSearchParams({mode: 'input', width: String(state.zoom ? 1920 : 960)});
+        if (state.view.defects) params.set('defects', '1');
+        image.src = `/preview/${encodeURIComponent(item.id)}?${params}`;
       } else if (image.dataset.fallback !== 'original' && safeImageUrl(item.image_url)) {
         image.dataset.fallback = 'original'; image.src = safeImageUrl(item.image_url);
       } else {
@@ -647,6 +653,7 @@
   for (const id of ['source', 'detailSource']) $(id).onchange = () => { state.view.source = $(id).value; viewChanged(); };
   for (const id of ['alpha', 'detailAlpha']) $(id).oninput = () => { state.view.alpha = $(id).value; viewChanged(false); };
   for (const id of ['unknown', 'detailUnknown']) $(id).onchange = () => { state.view.unknown = $(id).checked; viewChanged(); };
+  for (const id of ['defects', 'detailDefects']) $(id).onchange = () => { state.view.defects = $(id).checked; viewChanged(); };
   $('detailZoom').onclick = () => { state.zoom = !state.zoom; syncViewControls(); $('detailStage').scrollTo(0, 0); renderDetailPreview(); };
   $('closeDetail').onclick = closeDetail;
   $('detailPrev').onclick = () => navigateDetail(-1); $('detailNext').onclick = () => navigateDetail(1);

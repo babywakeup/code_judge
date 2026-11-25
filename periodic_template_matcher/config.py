@@ -11,15 +11,27 @@ from typing import Any
 OPTION_GROUPS = {
     'objects': {'ordered_object_class', 'object_cycle', 'object_min_score', 'object_min_gap',
                 'object_min_visible', 'object_candidates', 'object_spacing_weight', 'object_order_axis',
-                'object_visible_count'},
+                'object_visible_count', 'object_min_work_pixels', 'object_min_variance'},
     'step1': {'scale', 'max_side', 'valid_height',
-              'valid_x_start', 'valid_x_end', 'valid_y_start', 'valid_y_end'},
-    'step2': {'backend', 'angles', 'scales', 'peaks_per_hypothesis', 'seed', 'template_workers'},
+              'valid_x_start', 'valid_x_end', 'valid_y_start', 'valid_y_end',
+              'canny_thresholds', 'low_frequency_canny_thresholds'},
+    'step2': {'backend', 'angles', 'scales', 'peaks_per_hypothesis', 'seed', 'template_workers',
+              'coarse_min_separation_px'},
     'step3': {'refine_candidates', 'ecc_iterations', 'ecc_roi', 'edge_tolerance_px',
-              'min_overlap', 'min_score', 'min_template_gap', 'min_candidate_gap'},
+              'min_overlap', 'min_score', 'min_template_gap', 'min_candidate_gap', 'robust_appearance',
+              'robust_min_ncc', 'robust_min_local_consistency', 'refined_min_separation_px',
+              'ecc_epsilon', 'min_gray_std', 'min_edge_pixels'},
     'periodic': {'periodic_completion', 'period_vectors', 'periodic_anchor_class',
                  'periodic_max_steps', 'periodic_min_ncc', 'periodic_min_edge', 'class_periodicity',
-                 'shared_periods'},
+                 'shared_periods', 'local_min_overlap', 'local_context_size', 'min_contour_pixels',
+                 'periodic_low_frequency_min_ncc', 'periodic_low_frequency_edge_cap'},
+    'occlusion': {'occlusion_texture_window', 'occlusion_texture_floor', 'occlusion_texture_floor_ratio',
+                  'occlusion_texture_ratio', 'occlusion_tone_sigma', 'occlusion_dark_ratio',
+                  'occlusion_dark_delta', 'occlusion_texture_area', 'occlusion_dark_area',
+                  'occlusion_texture_close', 'occlusion_dark_close', 'occlusion_envelope_close',
+                  'occlusion_anchor_window', 'occlusion_anchor_visible', 'occlusion_anchor_variance',
+                  'occlusion_anchor_ncc', 'occlusion_anchor_max_period_ratio',
+                  'object_white_level', 'object_white_min_area'},
     'evaluation': {'label_mode', 'include_background'},
 }
 
@@ -31,7 +43,8 @@ def _class_options(classes: Any) -> dict[str, Any]:
     policies, matching = {}, {}
     parameters = {'cycle': 'object_cycle', 'visible_count': 'object_visible_count', 'min_score': 'object_min_score',
                   'min_gap': 'object_min_gap', 'min_visible': 'object_min_visible',
-                  'candidates': 'object_candidates', 'spacing_weight': 'object_spacing_weight'}
+                  'candidates': 'object_candidates', 'spacing_weight': 'object_spacing_weight',
+                  'min_work_pixels': 'object_min_work_pixels', 'min_variance': 'object_min_variance'}
     for key, rule in classes.items():
         if (type(key) not in (str, int) or not str(key).isascii() or not str(key).isdigit()
                 or str(int(key)) != str(key) or not 1 <= int(key) <= 65535):
@@ -98,10 +111,46 @@ class MatcherConfig:
     object_min_visible: float = .15
     object_candidates: int = 8
     object_spacing_weight: float = .3
+    object_min_work_pixels: int = 64
+    object_min_variance: float = .0025
     valid_x_start: int = 0
     valid_x_end: int | None = None
     valid_y_start: int = 0
     valid_y_end: int | None = None
+    robust_appearance: bool = False  # Use low-frequency evidence and verified-lattice occlusion fills.
+    robust_min_ncc: float = .75
+    robust_min_local_consistency: float = .7
+    coarse_min_separation_px: float = 4.
+    refined_min_separation_px: float = 3.
+    ecc_epsilon: float = 1e-5
+    min_gray_std: float = 2.
+    min_edge_pixels: int = 40
+    canny_thresholds: Sequence[float] = (35, 100)
+    low_frequency_canny_thresholds: Sequence[float] = (12, 36)
+    local_min_overlap: float = .2
+    local_context_size: int = 25
+    min_contour_pixels: int = 64
+    periodic_low_frequency_min_ncc: float = .75
+    periodic_low_frequency_edge_cap: float = .45
+    occlusion_texture_window: int = 17
+    occlusion_texture_floor: float = 2.
+    occlusion_texture_floor_ratio: float = .65
+    occlusion_texture_ratio: float = .62
+    occlusion_tone_sigma: float = 5.
+    occlusion_dark_ratio: float = .75
+    occlusion_dark_delta: float = 16.
+    occlusion_texture_area: int = 96
+    occlusion_dark_area: int = 384
+    occlusion_texture_close: int = 9
+    occlusion_dark_close: int = 13
+    occlusion_envelope_close: int = 25
+    occlusion_anchor_window: int = 31
+    occlusion_anchor_visible: float = .7
+    occlusion_anchor_variance: float = .01
+    occlusion_anchor_ncc: float = .85
+    occlusion_anchor_max_period_ratio: float = .5
+    object_white_level: int = 230
+    object_white_min_area: int = 64
 
     @classmethod
     def from_options(cls, options: dict[str, Any], *, object_order_axis: str | None = None) -> MatcherConfig:
@@ -178,8 +227,42 @@ class MatcherConfig:
         return all(abs(v[axis]) > 0 and abs(v[1-axis]) <= .15*abs(v[axis]) for v in vectors)
 
     def validate(self) -> None:
+        for name in ('canny_thresholds', 'low_frequency_canny_thresholds'):
+            values = getattr(self, name)
+            if (not isinstance(values, (tuple, list)) or len(values) != 2
+                    or any(type(value) not in (int, float) or not isfinite(value) for value in values)
+                    or not 0 <= values[0] < values[1]):
+                raise ValueError(f'{name} requires two increasing nonnegative thresholds')
+        for name in ('robust_min_ncc', 'robust_min_local_consistency', 'local_min_overlap',
+                     'periodic_low_frequency_min_ncc', 'periodic_low_frequency_edge_cap',
+                     'occlusion_texture_floor_ratio', 'occlusion_texture_ratio', 'occlusion_dark_ratio',
+                     'occlusion_anchor_visible', 'occlusion_anchor_ncc', 'occlusion_anchor_max_period_ratio'):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not 0 <= value <= 1:
+                raise ValueError(f'{name} must be between 0 and 1')
+        for name in ('local_context_size', 'occlusion_texture_window', 'occlusion_texture_close',
+                     'occlusion_dark_close', 'occlusion_envelope_close', 'occlusion_anchor_window'):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1 or value % 2 == 0:
+                raise ValueError(f'{name} must be a positive odd integer')
+        for name in ('min_contour_pixels', 'min_edge_pixels', 'object_min_work_pixels',
+                     'occlusion_texture_area', 'occlusion_dark_area',
+                     'object_white_min_area'):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f'{name} must be a positive integer')
+        for name in ('coarse_min_separation_px', 'refined_min_separation_px', 'ecc_epsilon', 'min_gray_std',
+                     'object_min_variance',
+                     'occlusion_texture_floor', 'occlusion_tone_sigma', 'occlusion_dark_delta',
+                     'occlusion_anchor_variance'):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be positive and finite')
+        if type(self.object_white_level) is not int or not 0 <= self.object_white_level <= 255:
+            raise ValueError('object_white_level must be an integer in 0..255')
         if type(self.ecc_roi) is not bool:
             raise ValueError('ecc_roi must be bool')
+        if type(self.robust_appearance) is not bool:
+            raise ValueError('robust_appearance must be bool')
         if type(self.shared_periods) is not bool:
             raise ValueError('shared_periods must be bool')
         for axis, start, end in (('x', self.valid_x_start, self.valid_x_end),
