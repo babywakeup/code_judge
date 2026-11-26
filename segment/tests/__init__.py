@@ -1,0 +1,1 @@
+"""Offline CPU compatibility tests for segment."""
