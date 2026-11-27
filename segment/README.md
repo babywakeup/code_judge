@@ -5,9 +5,40 @@
 
 ## 支持范围
 
-- `SceneChangeConfig(PretrainedConfig)`：保存骨干、特征层、facet、注意力、输出尺寸、冻结策略和损失配置。
-- `SceneChangeForSemanticSegmentation(PreTrainedModel)`：`save_pretrained` / `from_pretrained`、
-  safetensors、结构化 `ModelOutput`、训练损失、梯度检查点。
+模型按 Transformers CLIP 的具名模型家族方式组织，当前实现位于
+[models/scene_change](models/scene_change/__init__.py)：配置、模型、双图处理器和可选 PEFT helper。
+顶层只保留包初始化和 [demo.py](demo.py) 两个 Python 文件，不再保留重复的兼容转发文件。
+模型类仍可通过 `from segment import SceneChangeConfig, SceneChangeForSemanticSegmentation` 使用；
+具名模型也可直接从 `segment.models.scene_change` 导入；旧的 `segment.model` 源码目录已移除。
+
+目录结构：
+
+```text
+segment/
+├── __init__.py            # 模型导出与 HF AutoClass 注册
+├── demo.py                # 薄入口：参数解析与训练/smoke 分发
+├── models/
+│   ├── assets.py          # 模型家族共用的本地骨干路径解析
+│   └── scene_change/
+│       ├── __init__.py
+│       ├── configuration_scene_change.py
+│       ├── modeling_scene_change.py
+│       ├── image_processing_scene_change.py
+│       └── peft_utils.py
+├── data/                  # 数据集与预处理适配
+├── training/
+│   ├── config.py          # CLI 参数、模型与数据集构建
+│   ├── trainer.py         # SceneChangeTrainer(Trainer)、流式分割指标
+│   └── runner.py          # TrainingArguments 配置、训练/验证/保存编排
+├── tools/                 # checkpoint 转换与随机输入 smoke 检查
+└── tests/                 # 离线协议、模型及 Trainer 测试
+```
+
+- `SceneChangeConfig(PreTrainedConfig)`：采用 CLIP 同样的 `@strict` 声明式字段，
+  `__post_init__` 整理默认值与嵌套骨干，`validate_architecture` 集中检查配置约束。
+- `SceneChangePreTrainedModel`：HF 元信息、参数初始化、骨干冻结与加载后的冻结恢复。
+- `SceneChangeForSemanticSegmentation(SceneChangePreTrainedModel)`：特征、交互、解码与输出编排；
+  损失独立为 `scene_change_loss`，字典/tuple 输出统一使用 `ModelOutput`。
 - `SceneChangeImageProcessor(BaseImageProcessor)`，别名 `SceneChangeProcessor`：双图同步预处理、
   标签同步裁剪、保存加载、预测后处理。单一图像模态，不需要 tokenizer / 多模态 `ProcessorMixin`。
 - `AutoConfig`、`AutoModelForSemanticSegmentation`、`AutoImageProcessor`、`AutoProcessor`。
@@ -18,18 +49,27 @@
 **没有迁移** ResNet、CoAttention、MTF、TemporalAttention 等消融模型；不支持 DINOv2 register-token 变体。
 当前不是 Transformers 内置单图 segmentation pipeline：推理必须同时传入两张图。
 
+这里借鉴 CLIP 的模块边界，而非改成 CLIP 的图文架构：不额外引入 tokenizer、重复的
+`ProcessorMixin` 或依赖 Transformers 私有懒加载机制的小型包装层。
+原 `model_type="scene_change"` 和参数键名保持不变，已有完整模型与 PEFT 权重仍按原语义加载。
+
+## PSCD 数据加载
+
+新增独立的 [data](data/README.md) 子包，提供 `PSCD`（整图）、`CroppedPSCD`（默认
+15 个重叠块）和 `DiffViewPSCD`（错位视角），沿用参考固定划分，不复制原始图片。
+默认查找仓库下的 `data_/PSCD`，输出可直接通过 `DataLoader` 送入模型。
+原始高分辨率数据到参考裁剪尺寸的适配策略与使用示例见上述文档。
+
 ### 环境与验证
 
-开发及测试使用用户指定的 **mura_det / Python 3.12.14**：
-`/data2/zrx/mura_det/.venv/bin/python`，PyTorch 2.14.0+cu126、Transformers 5.17.0。
-依赖见 [requirements.txt](requirements.txt)，LoRA 需要 `peft`，不做 LoRA 时可不安装它。
-本实现只在上述 Transformers 版本上做了运行验证，不声称已经验证 4.x。
+需要 Python 3.12+；依赖版本范围见 [requirements.txt](requirements.txt)。LoRA 需要 `peft`，
+不使用 LoRA 时可不安装它。本实现面向 Transformers 5.x，不保证兼容 4.x。
 
-在仓库根目录安装/运行：
+在仓库根目录安装依赖并运行离线测试：
 
 ```bash
-/data2/zrx/mura_det/.venv/bin/python -m pip install -r segment/requirements.txt
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data2/zrx/mura_det/.venv/bin/python -m unittest segment.tests.test_scene_change -v
+python -m pip install -r segment/requirements.txt
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest segment.tests.test_scene_change -v
 ```
 
 ## 架构与兼容语义
@@ -62,15 +102,19 @@ image B ── shared HF Dinov2Model ── normalized patch Q/K/V/token ── 
 **logits 为 `[B,num_labels,H,W]`**，而不是原项目的 `[B,H,W,num_labels]`。
 `output_hidden_states=True` 返回交互前的两个归一化 patch 特征 `[B,N,C]`，不返回全部骨干层。
 
+调试特征时，可直接调用 `model.get_image_features(pixel_values, layer_index=None, facet=None)`，
+默认使用第一个分支的层和 facet，不执行交互层或分割头。输入校验、解码和损失分别在
+`_validate_inputs`、`_decode_features`、`scene_change_loss`，主 `forward` 只保留清晰的数据流。
+
 ## 1. 从预训练骨干初始化
 
-这会读取 HF 本地缓存或下载 DINOv2 权重，**变化分割头仍是随机初始化，必须训练**。
+以下示例只读取已有本地 DINOv2 权重，**变化分割头仍是随机初始化，必须训练**。
 
 ```python
 from segment import SceneChangeForSemanticSegmentation, SceneChangeProcessor
 
 model = SceneChangeForSemanticSegmentation.from_backbone_pretrained(
-    "facebook/dinov2-small",   # 也可以是本地 HF DINOv2 目录
+    "../../hf_cache/facebook/dinov2-small",
     feature_layer=11,
     facet="query",
     facet_pair="query",
@@ -79,7 +123,7 @@ model = SceneChangeForSemanticSegmentation.from_backbone_pretrained(
     attention_mode="cross",
     classifier_relu=False,
     freeze_backbone=True,
-    # backbone_load_kwargs={"local_files_only": True},
+    backbone_load_kwargs={"local_files_only": True},
 )
 processor = SceneChangeProcessor(size=504)
 
@@ -87,8 +131,55 @@ model.save_pretrained("outputs/change_base")
 processor.save_pretrained("outputs/change_base")
 ```
 
-`SceneChangeForSemanticSegmentation(SceneChangeConfig(...))` 是完全随机初始化，**不会下载**骨干。
-`from_pretrained` 则用于加载已经保存的**完整变化模型**，不要把 DINOv2 模型 ID 传给它冒充分割权重。
+### 配置驱动的 DINOv2 / DINOv3 ViT 初始化
+
+`backbone_config` 通过 `AutoConfig` 根据 `model_type` 还原，不再固定为 DINOv2。
+支持标准 DINOv2 small/base/large/giant，以及 DINOv3 ViT（包括 register tokens 和 RoPE）。
+不支持 DINOv2 register-token 变体、DINOv3 ConvNeXt 或带下游任务头的骨干权重。
+
+```python
+from segment import SceneChangeConfig, SceneChangeForSemanticSegmentation
+
+config = SceneChangeConfig(
+    backbone_name_or_path="../../hf_cache/facebook/dinov3-vitb16-pretrain-lvd1689m",
+    use_pretrained_backbone=True,
+    classifier_relu=False,
+)
+model = SceneChangeForSemanticSegmentation.from_config(config)
+```
+
+- `use_pretrained_backbone=True`：直接调用 `AutoModel.from_pretrained` 读取本地骨干权重，
+  不再先构建另一份随机骨干再复制。交互层和变化分割头仍随机初始化。
+- `use_pretrained_backbone=False`（默认）：使用 `AutoModel.from_config` 随机初始化骨干；
+  若只提供来源目录，仅读取其中的结构配置，不读取权重。
+- 显式提供 `backbone_config` 且关闭预训练开关时，不需要来源目录。
+- 直接构造 `SceneChangeForSemanticSegmentation(config)` 和 HF 的
+  `AutoModelForSemanticSegmentation.from_config(config)` 遵循同一初始化开关。
+- 所有来源加载均限制 `local_files_only=True`，缺失目录或不完整骨干权重会报错，不下载、不静默回退。
+
+`from_pretrained` 用于加载已经保存的**完整变化模型**：即使保存配置的预训练开关开启，
+恢复也不会再次读取原始骨干目录，完整 checkpoint 可独立使用。
+不要把 DINOv2/DINOv3 骨干目录传给完整变化模型的 `from_pretrained`。
+
+DINOv3 返回的特征去除 CLS 和全部 register tokens。`query/key/value` 表示原生线性投影结果，
+其中 Q/K 在 RoPE 之前提取；前面的完整编码层正常执行原生 RoPE 注意力。
+`token` 表示所选编码层的输出，不额外应用骨干最终的 LayerNorm。
+`backbone_interpolation="reference"` 仅适用于 DINOv2。
+
+本轮适配模型加载与计算接口，不改变训练数据预处理策略。使用真实 DINOv3 数据训练时，
+还须按其预处理配置启用对应的归一化；当前训练 Demo 不会自动继承骨干的预处理配置。
+
+仓库根目录的 [test_backbone_loading.py](../test_backbone_loading.py) 默认对本地 DINOv2-small、
+DINOv2-base 和 DINOv3-ViT-B/16 分别检查预训练/随机初始化、四种特征、矩形网格与有限损失：
+
+```bash
+python test_backbone_loading.py
+python test_backbone_loading.py --roundtrip
+python test_backbone_loading.py --backbone ../../hf_cache/facebook/dinov2-large --mode pretrained
+```
+
+预训练检查逐个精确对比本地 safetensors 参数，不额外加载第二份骨干。
+`--roundtrip` 额外保存并重新加载完整任务模型，需要临时磁盘空间；默认仅使用 CPU。
 
 ## 2. 保存后的完整模型加载与推理
 
@@ -151,7 +242,7 @@ outputs.loss.backward()
 ```python
 from peft import get_peft_model, PeftModel
 from segment import SceneChangeForSemanticSegmentation
-from segment.peft_utils import get_lora_config
+from segment.models.scene_change.peft_utils import get_lora_config
 
 # 基座应是已经训练/转换过的变化检测模型，或即将训练的初始化模型。
 base = SceneChangeForSemanticSegmentation.from_pretrained("outputs/change_base")
@@ -187,20 +278,51 @@ model = PeftModel.from_pretrained(base, "outputs/change_adapter", is_trainable=T
 PEFT 通用 wrapper 使用 `TrainingArguments(label_names=["labels"], ...)` 明确标注标签名；
 普通训练不传 `TaskType.SEQ_CLS` / `FEATURE_EXTRACTION` 之类 NLP 任务类型。
 
-## 5. 原项目 checkpoint 转换
+## 5. 真实数据训练 Demo
+
+[demo.py](demo.py) 仅负责入口分发，实际使用
+[SceneChangeTrainer](training/trainer.py)（继承 `transformers.Trainer`），不再手写训练循环。
+优化器、调度器、梯度累积、AMP、设备放置、验证和 checkpoint 均交由 Trainer 管理。
+默认使用本地 VL-CMU-CD 的固定 train/val 划分，
+以 `../../hf_cache/facebook/dinov2-small` 中的预训练权重初始化骨干，并从随机变化分割头开始训练。
+模型路径相对于仓库根目录解析，且骨干始终以 `local_files_only=True` 加载，不会连接 Hugging Face 下载。
+如需使用 base，可传 `--backbone ../../hf_cache/facebook/dinov2-base`。可指定 `--data-root`、
+`--device`、batch size、epoch、学习率、AMP 和输出目录；训练后保存完整 HF 模型、processor 与验证指标。
+PSCD 可通过 `--dataset pscd --data-root data_/PSCD` 使用；数据默认处理尺寸保留各自 dataset 行为。
+每个 epoch 自动验证并保存 checkpoint，最多保留两个；结束后保存完整 HF 模型、processor、
+Trainer 状态以及标准的 train/eval JSON 指标。验证按批次累计混淆矩阵，不保留整个数据集的 logits。
+`--gradient-accumulation-steps` 和 `--gradient-checkpointing` 可控制显存占用。
+如果已有完整变化模型，可用 `--init-model` 初始化新训练；不要把单独的 PEFT adapter 当完整模型传入。
+要恢复优化器、调度器、步数与 RNG 状态，请使用 `--resume-from-checkpoint` 指向 Trainer checkpoint 目录。
+`--device` 支持 `auto/cpu/cuda`，多卡选择由 `CUDA_VISIBLE_DEVICES` / Transformers 管理。
+
+```bash
+python -m segment.demo --dataset vl-cmu-cd --epochs 1 --batch-size 2 --output-dir outputs/vl-demo
+python -m segment.demo --dataset pscd --data-root data_/PSCD --epochs 1
+```
+
+`--random-backbone --max-steps 2` 可用于小型离线训练管线检查，但该随机骨干不适用于精度评估。
+不需要数据集的合成前向/反向检查可运行 `python -m segment.demo --smoke`；
+实现位于 [tools/smoke.py](tools/smoke.py)。旧的顶层 smoke 与 converter 模块入口已移除。
+
+调试时：参数和数据构建看 [training/config.py](training/config.py)，训练入口断点放在
+[training/runner.py](training/runner.py)，损失检查、预测及验证指标断点放在
+[training/trainer.py](training/trainer.py)。默认 `--workers 0`，便于单进程调试数据加载。
+
+## 6. 原项目 checkpoint 转换
 
 在仓库根目录：
 
 ```bash
-/data2/zrx/mura_det/.venv/bin/python -m segment.convert_checkpoint \
+python -m segment.tools.convert_checkpoint \
     --checkpoint /path/to/dinov2.2CrossAttn.CMU.pth \
     --output outputs/change_cmu
 ```
 
-离线转换时，提前准备对应 HF DINOv2 目录：
+转换默认使用 `../../hf_cache/facebook/dinov2-*` 中的对应本地骨干，始终离线加载：
 
 ```bash
-/data2/zrx/mura_det/.venv/bin/python -m segment.convert_checkpoint \
+python -m segment.tools.convert_checkpoint \
     --checkpoint /path/to/reference.pth \
     --backbone /path/to/local/dinov2-small \
     --local-files-only \
@@ -222,8 +344,9 @@ small 本地合成 checkpoint 的完整转换经过验证；发布权重以及 b
 
 ## 测试覆盖
 
-[tests/test_scene_change.py](tests/test_scene_change.py) 的 **19 项离线 CPU 测试**覆盖：
+[tests/test_scene_change.py](tests/test_scene_change.py) 的离线 CPU 模型测试覆盖：
 
+- 具名模型家族导出与继承、声明式/旧格式配置、独立损失和 tuple 输出约定。
 - 前向/CE/反向、冻结与末层解冻、梯度检查点、多类别配置保存。
 - Q/K/V/token 提取与骨干实际 forward hooks 对照。
 - 参考代码 `TwoCrossAttention` 数值对照、完整权重键映射、严格缺失检查。
@@ -231,6 +354,11 @@ small 本地合成 checkpoint 的完整转换经过验证；发布权重以及 b
 - 处理器缩放、同步裁剪、补边、掩码映射、numpy 输出及后处理。
 - Auto 类本地加载，及隔离进程中不导入 `segment` 的 `trust_remote_code` 加载。
 - 骨干/交互层 LoRA 梯度、adapter 保存恢复、merge 后一致性，PEFT + `Trainer` CPU 单步。
+
+[tests/test_backbones.py](tests/test_backbones.py) 另覆盖配置加载开关、完整 checkpoint 脱离原始骨干目录、
+DINOv3 四类特征与原生 hooks 对照、BF16 输入类型、LoRA/梯度检查点与冻结策略恢复，
+以及 DINOv2 四种尺寸的 meta-device 结构构造。large/giant 未在本地加载真实预训练权重。
+真实 small/base/DINOv3-base 权重的逐参数加载和完整模型保存恢复由根目录脚本单独验证。
 
 这些测试验证接口和转换逻辑，不验证真实数据集精度、GPU 性能或发布预训练权重的评测结果。
 来源与许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [LICENSE](LICENSE)。

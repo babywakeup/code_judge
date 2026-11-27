@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VL-CMU-CD · Dataset Studio</title>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <header><div class="brand"><span class="logo">◈</span><div>DATASET STUDIO<small>VL-CMU-CD · Processed RGB pairs</small></div></div><span class="badge">LOCAL / READ ONLY</span></header>
+  <main>
+    <section class="intro"><div><p class="eyebrow">SCENE CHANGE INSPECTOR</p><h1>逐组检查配对视角。</h1><p class="muted">展示模型预处理后的 Before、After 与真实变化标签；不加载模型、不生成预测。</p></div><div class="status"><i></i><span id="status">准备加载</span></div></section>
+    <section class="controls" aria-label="数据集设置">
+      <label>数据形式<select id="variant"><option value="paired">Paired · 原始同名配对</option><option value="diff">Diff view · 序列错位配对</option></select></label>
+      <label>数据划分<select id="split"><option value="test">Test</option><option value="val">Validation</option><option value="train">Train</option></select></label>
+      <label>相邻序列距离<select id="distance" disabled><option value="-3">−3 sequences</option><option value="-2">−2 sequences</option><option value="-1">−1 sequence</option><option value="1" selected>+1 sequence</option><option value="2">+2 sequences</option><option value="3">+3 sequences</option></select></label>
+    </section>
+    <section class="stats"><div><span>处理后样本</span><strong id="total">—</strong></div><div><span>Group 数</span><strong id="groups">—</strong></div><div><span>输出尺寸 W × H</span><strong id="size">—</strong></div><div><span>变化像素占比</span><strong id="ratio">—</strong></div></section>
+    <section class="group-head"><div><p class="eyebrow">SAMPLE <span id="position">—</span></p><h2 id="filename">加载中…</h2><p id="detail" class="muted">—</p></div><div class="toggles"><label><input id="overlay" type="checkbox"> 标签叠加到 Before</label><label><input id="pixelated" type="checkbox" checked> 像素显示</label></div></section>
+    <p id="error" class="error" role="alert" hidden></p>
+    <section id="triptych" class="triptych pixelated" aria-busy="true">
+      <article class="card"><div class="card-top"><span class="number">01</span><h3>Before <small>t0 / RGB</small></h3><a id="download-before" download="before.png">↓ PNG</a></div><div class="image-stage"><img id="before" alt="处理后的 Before RGB"></div><p>t0 时刻 · 模型实际输入</p></article>
+      <article class="card"><div class="card-top"><span class="number">02</span><h3>After <small>t1 / RGB</small></h3><a id="download-after" download="after.png">↓ PNG</a></div><div class="image-stage"><img id="after" alt="处理后的 After RGB"></div><p>t1 时刻 · 同名或错位序列配对</p></article>
+      <article class="card"><div class="card-top"><span class="number accent">03</span><h3>Label <small>GROUND TRUTH</small></h3><a id="download-label" download="label.png">↓ PNG</a></div><div class="image-stage"><img id="label" alt="变化标签，黑色未变化，白色变化"></div><p><span class="swatch black"></span> 0 未变化 <span class="swatch white"></span> 1 变化</p></article>
+    </section>
+    <section class="navigation"><button id="prev-group">↞ 上一组</button><button id="prev">← 上一样本</button><form id="jump"><label>样本索引 <input id="index" type="number" min="0" value="0" required></label><button>跳转</button></form><button id="next">下一样本 →</button><button id="next-group">下一组 ↠</button></section>
+    <input id="scrubber" aria-label="样本位置" type="range" min="0" max="0" value="0">
+    <section class="note"><strong>数据与处理</strong><p id="protocol">—</p><p id="root" class="path">—</p></section>
+    <footer><span>← / → 翻页 · A / D 切换 group</span><span>标签不是模型预测 · 随机增强关闭</span></footer>
+  </main>
+</body>
+</html>

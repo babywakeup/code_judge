@@ -1,6 +1,7 @@
 """No network, datasets, pretrained weights, or GPU are needed for these tests."""
 
 import importlib.util
+from dataclasses import fields, is_dataclass
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 
 import numpy as np
+from huggingface_hub.errors import StrictDataclassClassValidationError
 import torch
 from torch.nn import functional as F
 from transformers import (
@@ -17,11 +19,14 @@ from transformers import (
     AutoProcessor, Dinov2Config, Dinov2Model, Trainer, TrainingArguments,
 )
 
-from segment import SceneChangeConfig, SceneChangeForSemanticSegmentation, SceneChangeProcessor
-from segment.convert_checkpoint import (
+from segment import (
+    SceneChangeConfig, SceneChangeForSemanticSegmentation, SceneChangePreTrainedModel, SceneChangeProcessor,
+)
+from segment.models.scene_change.modeling_scene_change import scene_change_loss
+from segment.tools.convert_checkpoint import (
     config_from_reference, convert_checkpoint, convert_reference_state_dict, load_reference_weights,
 )
-from segment.peft_utils import get_lora_config
+from segment.models.scene_change.peft_utils import get_lora_config
 
 
 def tiny_config(**kwargs):
@@ -67,6 +72,82 @@ class SceneChangeTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
 
+    def test_named_model_family_exports_and_base(self):
+        from segment.models import SceneChangeConfig as exported_config
+        from segment.models.scene_change import SceneChangeForSemanticSegmentation as exported_model
+
+        self.assertIs(exported_config, SceneChangeConfig)
+        self.assertIs(exported_model, SceneChangeForSemanticSegmentation)
+        self.assertTrue(issubclass(exported_model, SceneChangePreTrainedModel))
+        self.assertEqual(exported_config.model_type, "scene_change")
+        self.assertTrue(exported_model.__module__.startswith("segment.models.scene_change."))
+        self.assertFalse((Path(__file__).resolve().parents[1] / "model").exists())
+
+    def test_declarative_config_defaults_legacy_dict_and_validation(self):
+        config = tiny_config(output_size=(28, 42), class_weights=(1, 2))
+        self.assertTrue(is_dataclass(config))
+        self.assertIn("backbone_config", {field.name for field in fields(config)})
+        self.assertEqual(config.feature_layer_pair, config.feature_layer)
+        self.assertEqual(config.decoder_hidden_size, 32)
+        self.assertEqual(config.output_size, [28, 42])
+        self.assertEqual(config.class_weights, [1, 2])
+        self.assertEqual(config.id2label, {0: "unchanged", 1: "changed"})
+        legacy = SceneChangeConfig.from_dict({
+            "model_type": "scene_change", "backbone_config": config.backbone_config.to_dict(),
+            "num_labels": 3, "class_weights": [1, 2, 3], "dropout": 0,
+            "backbone_pretrained_source": "local-test-model",
+        })
+        self.assertEqual(legacy.num_labels, 3)
+        self.assertEqual(legacy.backbone_config.hidden_size, 32)
+        self.assertEqual(legacy.backbone_pretrained_source, "local-test-model")
+        for invalid in ({"dropout": 1}, {"feature_layer": 2}, {"output_size": [0, 28]},
+                        {"num_labels": 1}, {"class_weights": [1]}):
+            with self.subTest(invalid=invalid), self.assertRaises(StrictDataclassClassValidationError):
+                tiny_config(**invalid)
+
+    def test_public_image_features_and_invalid_selection(self):
+        model = SceneChangeForSemanticSegmentation(tiny_config()).eval()
+        pixels = torch.rand(1, 3, 42, 56)
+        with torch.no_grad():
+            features = model.get_image_features(pixels)
+            output = model(pixels, pixels, output_hidden_states=True)
+        torch.testing.assert_close(features, output.hidden_states[0], rtol=0, atol=0)
+        self.assertEqual(tuple(features.shape), (1, 12, 32))
+        with self.assertRaisesRegex(ValueError, "outside"):
+            model.get_image_features(pixels, layer_index=2)
+        with self.assertRaisesRegex(ValueError, "facet"):
+            model.get_image_features(pixels, facet="invalid")
+
+    def test_loss_helper_matches_weighted_ce_and_ignored_gradients(self):
+        logits = torch.randn(2, 3, 14, 21, requires_grad=True)
+        labels = torch.randint(0, 3, (2, 28, 42))
+        labels[:, 0] = 255
+        loss = scene_change_loss(logits, labels, class_weights=[1, 2, 3])
+        reference = F.cross_entropy(
+            F.interpolate(logits, size=(28, 42), mode="bilinear", align_corners=False),
+            labels, weight=logits.new_tensor([1, 2, 3]), ignore_index=255,
+        )
+        torch.testing.assert_close(loss, reference, rtol=0, atol=0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        logits.grad = None
+        ignored = scene_change_loss(logits, torch.full_like(labels, 255))
+        self.assertEqual(ignored.item(), 0)
+        ignored.backward()
+        self.assertEqual(logits.grad.count_nonzero().item(), 0)
+
+    def test_model_output_tuple_contract(self):
+        model = SceneChangeForSemanticSegmentation(tiny_config()).eval()
+        images = (torch.rand(1, 3, 28, 28), torch.rand(1, 3, 28, 28))
+        for with_labels in (False, True):
+            for hidden in (False, True):
+                inputs = {"labels": torch.zeros(1, 28, 28, dtype=torch.long)} if with_labels else {}
+                with torch.no_grad():
+                    result = model(*images, **inputs, return_dict=True, output_hidden_states=hidden)
+                    result_tuple = model(*images, **inputs, return_dict=False, output_hidden_states=hidden,
+                                         num_items_in_batch=1)
+                torch.testing.assert_close(result.to_tuple(), result_tuple, rtol=0, atol=0)
+
     def test_forward_loss_and_frozen_backbone(self):
         model = SceneChangeForSemanticSegmentation(tiny_config())
         batch = {"pixel_values": torch.rand(2, 3, 42, 56), "pixel_values_pair": torch.rand(2, 3, 42, 56),
@@ -94,7 +175,7 @@ class SceneChangeTests(unittest.TestCase):
             finally:
                 handle.remove()
             expected = F.normalize(captures[0][:, 1:], dim=-1)
-            torch.testing.assert_close(model._extract_features(pixels, 1, facet), expected)
+            torch.testing.assert_close(model.get_image_features(pixels, 1, facet), expected)
 
     def test_save_load_auto_and_no_backbone_download(self):
         model = SceneChangeForSemanticSegmentation(tiny_config()).eval()
@@ -210,8 +291,8 @@ assert processor.model_input_names == ['pixel_values', 'pixel_values_pair']
         state = reference_head(model)
         inputs = (torch.rand(1, 3, 42, 56), torch.rand(1, 3, 42, 56))
         with torch.no_grad():
-            x = model._extract_features(inputs[0], -1, "query")
-            y = model._extract_features(inputs[1], -1, "query")
+            x = model.get_image_features(inputs[0], -1, "query")
+            y = model.get_image_features(inputs[1], -1, "query")
             for index in range(2):
                 block = reference.TwoCrossAttention(32, 4, 0, 32, 4, 0).eval()
                 prefix = f"module.ca0s.{index}."
@@ -327,9 +408,9 @@ assert processor.model_input_names == ['pixel_values', 'pixel_values_pair']
         self.assertEqual(config.modules_to_save, ["fusion", "classifier"])
 
     def test_invalid_model_inputs_and_config(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(StrictDataclassClassValidationError, "divisible"):
             tiny_config(num_attention_heads=3)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(StrictDataclassClassValidationError, "facets"):
             tiny_config(facet="invalid")
         model = SceneChangeForSemanticSegmentation(tiny_config())
         with self.assertRaises(ValueError):

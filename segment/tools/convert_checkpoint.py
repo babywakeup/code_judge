@@ -1,7 +1,7 @@
 """Convert local reference DINOv2 attention checkpoints into an HF directory.
 
-Run as ``python -m segment.convert_checkpoint --help``. Loading legacy pickle
-objects is disabled unless the caller explicitly opts in for a trusted file.
+Run as ``python -m segment.tools.convert_checkpoint --help``. Loading legacy
+pickle objects is disabled unless explicitly enabled for a trusted file.
 """
 
 import argparse
@@ -11,9 +11,8 @@ from pathlib import Path
 import torch
 from transformers import Dinov2Config
 
-from .configuration_scene_change import SceneChangeConfig
-from .image_processing_scene_change import SceneChangeImageProcessor
-from .modeling_scene_change import SceneChangeForSemanticSegmentation
+from ..models.scene_change import SceneChangeConfig, SceneChangeForSemanticSegmentation, SceneChangeImageProcessor
+from ..models.assets import resolve_local_backbone
 
 
 BACKBONE_SPECS = {
@@ -60,8 +59,8 @@ def config_from_reference(options, backbone_config=None):
 def convert_reference_state_dict(state_dict):
     """Translate fused MHA/QKV projections and deduplicate the shared backbone.
 
-    Supports the trainable-only dictionaries produced by get_grad_required_state
-    as well as complete state_dict files. Unsupported names fail, never disappear.
+    Supports trainable-only and complete state_dict files. Unsupported names
+    fail explicitly rather than disappearing from the converted checkpoint.
     """
     converted = {}
 
@@ -152,16 +151,17 @@ def load_reference_weights(model, state_dict, *, backbone_is_pretrained=False):
 
 
 def convert_checkpoint(checkpoint_path, output_dir, *, backbone_source=None,
-                       local_files_only=False, allow_unsafe_pickle=False):
+                       local_files_only=True, allow_unsafe_pickle=False):
+    """Convert offline; local_files_only is retained for existing Python callers."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=not allow_unsafe_pickle)
     if not isinstance(checkpoint, dict) or "model" not in checkpoint or "args" not in checkpoint:
         raise ValueError("Expected a reference checkpoint containing model and args.model")
     config = config_from_reference(checkpoint["args"]["model"])
-    # Reference training normally saves ONLY trainable weights. Restore the exact
-    # corresponding foundation model explicitly rather than saving a random one.
-    source = backbone_source or config.backbone_pretrained_source
+    # Training-only checkpoints omit frozen backbone weights. Restore them from
+    # the corresponding local foundation model, never random initialization.
+    source = resolve_local_backbone(backbone_source or config.backbone_pretrained_source)
     model = SceneChangeForSemanticSegmentation.from_backbone_pretrained(
-        source, config=config, backbone_load_kwargs={"local_files_only": local_files_only},
+        str(source), config=config, backbone_load_kwargs={"local_files_only": True},
     )
     load_reference_weights(model, checkpoint["model"], backbone_is_pretrained=True)
     optimizer_options = checkpoint["args"].get("optimizer", {})
@@ -181,8 +181,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, help="Local reference .pth checkpoint")
     parser.add_argument("--output", required=True, help="Output HF model directory")
-    parser.add_argument("--backbone", help="Local HF DINOv2 directory or Hub ID")
-    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--backbone", help="Local HF DINOv2 directory (default: ../../hf_cache/facebook/<variant>)")
+    parser.add_argument("--local-files-only", action="store_true", help="Compatibility flag; always offline")
     parser.add_argument("--allow-unsafe-pickle", action="store_true",
                         help="Only enable for trusted checkpoints requiring legacy pickle objects")
     args = parser.parse_args()

@@ -2,9 +2,10 @@
 
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForSemanticSegmentation, AutoProcessor
 
-from .configuration_scene_change import SceneChangeConfig
-from .image_processing_scene_change import SceneChangeImageProcessor, SceneChangeProcessor
-from .modeling_scene_change import SceneChangeForSemanticSegmentation, SceneChangeOutput
+from .models import (
+    SceneChangeConfig, SceneChangeForSemanticSegmentation, SceneChangeImageProcessor,
+    SceneChangeOutput, SceneChangePreTrainedModel, SceneChangeProcessor,
+)
 
 
 def register_auto_classes():
@@ -21,6 +22,6 @@ def register_auto_classes():
 register_auto_classes()
 
 __all__ = [
-    "SceneChangeConfig", "SceneChangeForSemanticSegmentation", "SceneChangeOutput",
+    "SceneChangeConfig", "SceneChangePreTrainedModel", "SceneChangeForSemanticSegmentation", "SceneChangeOutput",
     "SceneChangeImageProcessor", "SceneChangeProcessor", "register_auto_classes",
 ]

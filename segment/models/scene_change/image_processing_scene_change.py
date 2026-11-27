@@ -9,12 +9,7 @@ from transformers.image_processing_utils import BatchFeature
 
 
 class SceneChangeImageProcessor(BaseImageProcessor):
-    """A single-modality processor usable via AutoImageProcessor/AutoProcessor.
-
-    Defaults reproduce the reference: uint8 -> [0,1], no ImageNet normalization,
-    center crop to patch-size multiples. Masks contain class IDs, not grayscale
-    intensity rescaling. A 0/255 binary mask requires mask_value_map={0:0,255:1}.
-    """
+    """Single-modality processor for paired RGB images and segmentation labels."""
 
     model_input_names = ["pixel_values", "pixel_values_pair"]
 
@@ -93,7 +88,6 @@ class SceneChangeImageProcessor(BaseImageProcessor):
 
     @staticmethod
     def _center_crop(tensor, size, fill=0):
-        # Match torchvision CenterCrop: pad smaller images, then rounded offset.
         height, width = tensor.shape[-2:]
         pad_h, pad_w = max(size[0] - height, 0), max(size[1] - width, 0)
         if pad_h or pad_w:
@@ -113,7 +107,6 @@ class SceneChangeImageProcessor(BaseImageProcessor):
         if segmentation_maps is None:
             masks = [None] * len(images)
         elif isinstance(segmentation_maps, (np.ndarray, torch.Tensor)) and segmentation_maps.ndim == 3:
-            # A singleton HWC/CHW mask is not a batch of H individual rows.
             if len(images) == 1 and (segmentation_maps.shape[0] == 1 or segmentation_maps.shape[-1] == 1):
                 masks = [segmentation_maps]
             else:
@@ -139,7 +132,6 @@ class SceneChangeImageProcessor(BaseImageProcessor):
             else:
                 size = (self.size["height"], self.size["width"])
             for key, tensor, integer in (("pixel_values", x, integer_x), ("pixel_values_pair", y, integer_y)):
-                # Float images in [0,1] are already scaled; never divide them twice.
                 if rescale and (integer or tensor.max() > 1):
                     tensor = tensor * self.rescale_factor
                 tensor = self._center_crop(tensor, size)
@@ -183,5 +175,6 @@ class SceneChangeImageProcessor(BaseImageProcessor):
         return results
 
 
-# Image-only processors do not need a tokenizer or a multimodal ProcessorMixin.
 SceneChangeProcessor = SceneChangeImageProcessor
+
+__all__ = ["SceneChangeImageProcessor", "SceneChangeProcessor"]
